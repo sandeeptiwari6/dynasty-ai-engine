@@ -54,16 +54,17 @@ class CollegeIngestion:
 
     def __init__(self, engine, api_key: Optional[str] = None):
         self.engine = engine
-        api_key = api_key or os.getenv("CFBD_API_KEY")
-
         if not api_key:
-            raise ValueError(
-                "CFBD API key required. Get one free at https://collegefootballdata.com/key "
-                "and set it as CFBD_API_KEY environment variable."
-            )
+            api_key = os.getenv("CFBD_API_KEY")
+
+            if not api_key:
+                raise ValueError(
+                    "CFBD API key required. Get one free at https://collegefootballdata.com/key "
+                    "and set it as CFBD_API_KEY environment variable."
+                )
         
         # Configure the CFBD client
-        config = cfbd.Configuration()
+        config = cfbd.Configuration(access_token=api_key)
         config.api_key["Authorization"] = api_key
         config.api_key_prefix["Authorization"] = "Bearer"
         self.cfbd_client = cfbd.ApiClient(config)
@@ -97,20 +98,20 @@ class CollegeIngestion:
         """
         for year in years:
             logger.info(f"Ingesting college stats for {year}...")
-            try:
-                self._ingest_year(year)
-                time.sleep(0.5)  # be polite to the API
-            except Exception as e:
-                logger.warning(f"Failed for {year}: {e}")
+            self._ingest_year(year)
+            time.sleep(0.5)  # be polite to the API
+            # try:
+            #     self._ingest_year(year)
+            #     time.sleep(0.5)  # be polite to the API
+            # except Exception as e:
+            #     logger.warning(f"Failed for {year}: {e}")
     
     def _ingest_year(self, year: int):
         """
         Pull all player stats and team stats for one year, compute context, store
         """
         # ---- Team stats (needed for dominator rating denominator) ----
-        print("RAW TEAM STATS")
         raw_team_stats = self.stats_api.get_team_stats(year=year)
-        print(raw_team_stats)
         team_context = self._build_team_context(raw_team_stats)
 
         # ---- Player stats ----
@@ -119,7 +120,7 @@ class CollegeIngestion:
         for category in self.STAT_CATEGORIES:
             try:
                 player_stats = self.stats_api.get_player_season_stats(
-                    year=year, stat_category=category
+                    year=year, category=category
                 )
                 for stat in player_stats:
                     stats.append((category, stat))
@@ -128,7 +129,7 @@ class CollegeIngestion:
             
         # Group by (player, team) and merge all categories
         player_data: dict = {}  # key: (player_id, team)
-        for category, stat in player_stats:
+        for category, stat in stats:
             key = (stat.player_id, stat.team)
             if key not in player_data:
                 player_data[key] = {
@@ -199,7 +200,7 @@ class CollegeIngestion:
         team_rosters: dict = {}
         for team in teams:
             try:
-                roster = self.players_api.get_roster(team=team, year=year)
+                roster = self.teams_api.get_roster(team=team, year=year)
                 for player in roster:
                     team_rosters[(player.id, team)] = {
                         "position": player.position,

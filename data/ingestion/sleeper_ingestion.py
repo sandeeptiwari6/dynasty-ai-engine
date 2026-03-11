@@ -1,6 +1,6 @@
+import os
 import requests
 from typing import Dict, List, Any
-from pathlib import Path
 import logging
 from datetime import datetime
 import pandas as pd
@@ -21,7 +21,7 @@ class SleeperClient:
         self.timeout = timeout
 
     def _get(self, endpoint: str) -> Any:
-        url = Path(self.BASE_URL) / endpoint
+        url = os.path.join(self.BASE_URL, endpoint)
         response = requests.get(url, timeout=self.timeout)
 
         if response.status_code != 200:
