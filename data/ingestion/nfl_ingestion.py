@@ -123,17 +123,14 @@ class NFLIngestion:
         logger.info(f"Ingesting seasonal stats for {years}...")
 
         player_stats_df = nfl.import_seasonal_data(years, s_type="REG")
-        print("RAW DATA")
         snap_df = self._load_snap_pct_for_season_stats(years)
-        print("SNAP DATA")
-        team_targets = self._load_team_targets(years)
-        print("TEAM TARGETS DATA")
+        # team_targets = self._load_team_targets(years)
         
         # Merge snap pct and team targets into seasonal
         if not snap_df.empty:
             player_stats_df = player_stats_df.merge(snap_df, on=["player_id", "season"], how="left")
-        if not team_targets.empty:
-            player_stats_df = player_stats_df.merge(team_targets, on=["season"], how="left")
+        # if not team_targets.empty:
+        #     player_stats_df = player_stats_df.merge(team_targets, on=["season"], how="left")
 
         # Compute derived metrics not in raw data
         player_stats_df["wopr"] = (1.5 * player_stats_df.get("target_share", 0)) + (0.7 * player_stats_df.get("air_yards_share", 0))
@@ -143,12 +140,8 @@ class NFLIngestion:
         player_stats_df["fantasy_ppg_half"] = (player_stats_df.get("fantasy_points", player_stats_df["fantasy_points_ppr"] * 0.9)) / player_stats_df["games"].replace(0, float("nan"))
         player_stats_df["completion_pct"] = player_stats_df["completions"] / player_stats_df["attempts"].replace(0, float("nan"))
 
-        records = []
-
-
-
-        for _, row in player_stats_df.iterrows():
-            records.append(NFLSeasonStats(
+        records = [
+            NFLSeasonStats(
                 player_id=str(row["player_id"]),
                 season=int(row["season"]),
                 season_type="REG",
@@ -188,7 +181,9 @@ class NFLIngestion:
                 wopr=row.get("wopr"),
                 tgt_per_game=row.get("tgt_per_game"),
                 snap_pct=row.get("snap_pct"),
-            ))
+            )
+            for _, row in player_stats_df.iterrows()
+        ]
 
         self._bulk_upsert(NFLSeasonStats, records, conflict_column=("player_id", "season", "season_type"))
         logger.info(f"{len(records)} seasonal stat rows ingested.")
@@ -214,7 +209,7 @@ class NFLIngestion:
         try:
             pbp = nfl.import_pbp_data(years, columns=[
                 "passer_player_id", "receiver_player_id", "pass_attempt",
-                "posteam", "season", "play_type"
+                "posteam", "season", "play_type", "game_id"
             ])
             pass_plays = pbp[pbp["pass_attempt"] == 1]
             team_targets = (
