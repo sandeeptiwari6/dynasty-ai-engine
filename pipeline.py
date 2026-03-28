@@ -56,7 +56,7 @@ def run_full_backfill(
     cfbd_key = cfbd_api_key or os.getenv("CFBD_API_KEY")
     if cfbd_key:
         college_pipeline = CollegeIngestion(engine, api_key=cfbd_key)
-        college_pipeline.run_full_backfill(start_year=max(2010, start_year - 5))
+        college_pipeline.run_full_backfill(start_year=start_year - 5, end_year=end_year)  # pull extra college years for older players' draft context
     else:
         logger.warning("  CFBD_API_KEY not set — skipping college stats. "
                        "Get a free key at https://collegefootballdata.com/key")

@@ -317,6 +317,11 @@ class CollegeSeasonStats(Base):
     team_rec_yards  = Column(Integer)
     team_rec_tds    = Column(Integer)
 
+    # Dominator ratings (player's share of team production)
+    dominatory_yards = Column(Float)
+    dominator_tds    = Column(Float)
+    dominator_score  = Column(Float)
+
     player = relationship("Player", back_populates="college_stats")
 
     __table_args__ = (

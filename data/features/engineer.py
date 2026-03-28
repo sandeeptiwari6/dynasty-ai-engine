@@ -199,7 +199,9 @@ class FeatureEngineer:
         )
 
         # Career games (context for sample size)
-        df["career_games"] = df.groupby("player_id")["games"].cumsum().shift(1)
+        df["career_games"] = df.groupby("player_id")["games"].transform(
+            lambda s: pd.to_numeric(s, errors="coerce").fillna(0).cumsum().shift(1)
+        )
 
         return df
 
@@ -220,7 +222,7 @@ class FeatureEngineer:
         df = df.sort_values(["player_id", "season"])
         df["snap_pct_trend"] = (
             df.groupby("player_id")["snap_pct"]
-            .transform(lambda s: rolling_diff(s))
+            .transform(lambda s: rolling_diff(pd.to_numeric(s, errors="coerce")))
         )
 
         # Role security score: composite of snap_pct + target_share + carries_per_game (position-adjusted)
@@ -533,11 +535,15 @@ class FeatureEngineer:
         players_slim = players_df[["player_id", "birth_date", "cfbd_id"]].copy()
         players_slim["birth_date"] = pd.to_datetime(players_slim["birth_date"], errors="coerce")
 
-        college_with_player = college_df.merge(
-            players_slim.rename(columns={"cfbd_id": "cfbd_player_id"}),
-            on="cfbd_player_id",
-            how="left"
-        )
+        # Normalize cfbd id dtypes to avoid int64 vs object merge errors
+        players_slim = players_slim.rename(columns={"cfbd_id": "cfbd_player_id"})
+        players_slim["cfbd_player_id"] = players_slim["cfbd_player_id"].astype("string")
+        if "cfbd_player_id" in college_df.columns:
+            college_df["cfbd_player_id"] = college_df["cfbd_player_id"].astype("string")
+        else:
+            college_df["cfbd_player_id"] = pd.Series(dtype="string")
+
+        college_with_player = college_df.merge(players_slim, on="cfbd_player_id", how="left")
         college_with_player["age_at_season"] = college_with_player.apply(
             lambda r: _age_on_date(r["birth_date"], date(int(r["season"]), 9, 1))
             if pd.notna(r.get("birth_date")) else np.nan,
@@ -546,7 +552,7 @@ class FeatureEngineer:
 
         breakout = (
             college_with_player[college_with_player["dominator_rating"] >= 0.20]
-            .groupby("player_id")["age_at_season"]
+            .groupby("cfbd_player_id")["age_at_season"]
             .min()
             .reset_index(name="breakout_age")
         )
@@ -577,13 +583,13 @@ class FeatureEngineer:
 
         # Map cfbd_player_id → player_id via players table
         cfbd_to_gsis = (
-            players_slim[players_slim["cfbd_id"].notna()]
+            players_slim[players_slim["cfbd_player_id"].notna()]
             .rename(columns={"cfbd_id": "cfbd_player_id"})
             [["player_id", "cfbd_player_id"]]
             .drop_duplicates()
         )
         best_college_season = best_college_season.merge(cfbd_to_gsis, on="cfbd_player_id", how="left")
-        best_college_season = best_college_season.merge(breakout, on="player_id", how="left")
+        best_college_season = best_college_season.merge(breakout, on="cfbd_player_id", how="left")
         best_college_season = best_college_season.merge(combine_slim, on="player_id", how="left")
 
         df = df.merge(

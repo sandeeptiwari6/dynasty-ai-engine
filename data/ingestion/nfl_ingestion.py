@@ -140,6 +140,10 @@ class NFLIngestion:
         player_stats_df["fantasy_ppg_half"] = (player_stats_df.get("fantasy_points", player_stats_df["fantasy_points_ppr"] * 0.9)) / player_stats_df["games"].replace(0, float("nan"))
         player_stats_df["completion_pct"] = player_stats_df["completions"] / player_stats_df["attempts"].replace(0, float("nan"))
 
+        # print(player_stats_df.size)
+        # print("DROPPING DUPLICATES")
+        # player_stats_df = player_stats_df.drop_duplicates()
+        # print(player_stats_df.size)
         records = [
             NFLSeasonStats(
                 player_id=str(row["player_id"]),

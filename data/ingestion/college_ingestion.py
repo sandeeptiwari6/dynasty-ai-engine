@@ -63,6 +63,8 @@ class CollegeIngestion:
                     "and set it as CFBD_API_KEY environment variable."
                 )
         
+        print(f"Using CFBD API key: {api_key[:4]}****{api_key[-4:]}")
+        
         # Configure the CFBD client
         config = cfbd.Configuration(access_token=api_key)
         config.api_key["Authorization"] = api_key
@@ -144,6 +146,19 @@ class CollegeIngestion:
         
         # Enrich with conference and position from player search
         self._enrich_player_metadata(player_data, year)
+
+        # Build ORM records and bulk upsert
+        records_created = 0
+        with get_session(self.engine) as session:
+            for key, data in player_data.items():
+                team = data.get("team")
+                team_ctx = team_context.get(team, {})
+                record = self._build_college_stats_record(data, team_ctx)
+                if record:
+                    session.merge(record)
+                    records_created += 1
+            session.commit()
+        logger.info(f"  → {records_created} college season records ingested for {year}")
     
     def _build_team_context(self, raw_team_stats) -> dict:
         """
@@ -223,11 +238,60 @@ class CollegeIngestion:
         if not data.get("cfbd_player_id"):
             return None
 
-        rec_yards = data.get("rec_yards", 0)
-        rec_tds = data.get("rec_tds", 0)
+        receptions = data.get("receptions", 0) or 0
+        rec_yards = data.get("rec_yards", 0) or 0
+        rec_tds = data.get("rec_tds", 0) or 0
 
-        rush_yards = data.get("rush_yards", 0)
-        rush_carries = data.get("rush_carries", 1)
+        rush_yards = data.get("rush_yards", 0) or 0
+        rush_carries = data.get("rush_carries", 1) or 1
+        rush_tds = data.get("rush_tds", 0) or 0
+
+        # Coerce team stat wrapper types (e.g. TeamStatStatValue) to numeric safely
+        def _unwrap_stat(val):
+            # If it's the cfbd model wrapper, get actual_instance; otherwise use value directly
+            try:
+                inner = getattr(val, "actual_instance", val)
+                return float(inner) if inner is not None else 0.0
+            except Exception:
+                try:
+                    return float(val)
+                except Exception:
+                    return 0.0
+        
+        # Team totals (CFBD provides passing and receiving totals; rushing may not be present)
+        team_pass_y = _unwrap_stat(team_ctx.get("team_pass_yards"))
+        team_pass_t = _unwrap_stat(team_ctx.get("team_pass_tds"))
+        team_rec_y = _unwrap_stat(team_ctx.get("team_rec_yards"))
+        team_rec_t = _unwrap_stat(team_ctx.get("team_rec_tds"))
+
+        # Player totals
+        player_pass_y = data.get("pass_yards") or 0
+        player_pass_t = data.get("pass_tds") or 0
+        player_rec_y = rec_yards or 0
+        player_rec_t = rec_tds or 0
+        player_rush_y = rush_yards or 0
+        player_rush_t = rush_tds or 0
+
+        pass_attempts = data.get("pass_attempts")
+        if pass_attempts is None or pass_attempts == 0:
+            completion_pct = 0
+        else:
+            pass_completions = data.get("pass_completions")
+            if pass_completions:
+                completion_pct = pass_completions / pass_attempts
+            else:
+                completion_pct = 0
+
+        # Team total yards for dominator denominator: use pass + rec as available
+        team_total_yards = max(team_pass_y + team_rec_y, 1)
+        team_total_tds = max(team_pass_t + team_rec_t, 1)
+
+        # Yards dominator: share of team yards (rush+rec+pass) vs available team totals
+        yards_share = (player_pass_y + player_rec_y + player_rush_y) / team_total_yards
+        # TD dominator: share of team TDs (pass TDs + rec TDs + rush TDs) vs available team totals
+        td_share = (player_pass_t + player_rec_t + player_rush_t) / team_total_tds
+        # Combined dominator (0-1)
+        dominator_score = max(0.0, min(1.0, (yards_share + td_share) / 2.0))
 
         return CollegeSeasonStats(
             cfbd_player_id=data["cfbd_player_id"],
@@ -243,9 +307,7 @@ class CollegeIngestion:
             pass_yards=data.get("pass_yards"),
             pass_tds=data.get("pass_tds"),
             interceptions=data.get("interceptions"),
-            completion_pct=(
-                (data.get("pass_completions") or 0) / max(data.get("pass_attempts") or 1, 1)
-            ),
+            completion_pct=completion_pct,
             # Rushing
             rush_carries=data.get("rush_carries"),
             rush_yards=rush_yards,
@@ -255,12 +317,16 @@ class CollegeIngestion:
             receptions=data.get("receptions"),
             rec_yards=rec_yards,
             rec_tds=rec_tds,
-            yards_per_rec=rec_yards / max(data.get("receptions") or 1, 1),
+            yards_per_rec=rec_yards / max(receptions, 1),
             # Team context (needed for dominator rating feature engineering)
-            team_pass_yards=team_ctx.get("team_pass_yards"),
-            team_pass_tds=team_ctx.get("team_pass_tds"),
-            team_rec_yards=team_ctx.get("team_rec_yards"),
-            team_rec_tds=team_ctx.get("team_rec_tds"),
+            team_pass_yards=team_pass_y,
+            team_pass_tds=team_pass_t,
+            team_rec_yards=team_rec_y,
+            team_rec_tds=team_rec_t,
+            # Dominator metrics
+            dominatory_yards=yards_share,
+            dominator_tds=td_share,
+            dominator_score=dominator_score
         )
     
     # ------------------------------------------------------------------
