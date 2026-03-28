@@ -1,6 +1,7 @@
 __pycache__/
 build/
 dist/
+notebooks/.ipynb_checkpoints/
 *.egg-info
 *.db
 Pipfile
