@@ -240,6 +240,7 @@ class NFLWeeklySnaps(Base):
     offense_snaps   = Column(Integer)
     offense_pct     = Column(Float)
     defense_snaps   = Column(Integer)
+    defense_pct     = Column(Float)
     st_snaps        = Column(Integer)
 
     __table_args__ = (

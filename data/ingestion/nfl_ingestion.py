@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
 from datetime import datetime
+from numpy.ma import ids
 import pandas as pd
 
 import nfl_data_py as nfl
@@ -43,6 +44,9 @@ class NFLIngestion:
 
     def __init__(self, engine):
         self.engine = engine
+
+        ids = nfl.import_ids()
+        self.player_ids = ids[['gsis_id', 'pfr_id']][~ids['gsis_id'].isna()].rename(columns={'gsis_id': 'player_id', 'pfr_id': 'pfr_player_id'})
 
     def run_full_backfill(self, start_year: int = 2015, end_year: Optional[int] = None):
         """
@@ -133,17 +137,18 @@ class NFLIngestion:
         #     player_stats_df = player_stats_df.merge(team_targets, on=["season"], how="left")
 
         # Compute derived metrics not in raw data
+        player_stats_df["yards_per_attempt"] = player_stats_df["passing_yards"] / player_stats_df["attempts"].replace(0, float("nan"))
+        player_stats_df["rushing_yards_per_attempt"] = player_stats_df["rushing_yards"] / player_stats_df["carries"].replace(0, float("nan"))
+        player_stats_df["yards_per_reception"] = player_stats_df["receiving_yards"] / player_stats_df["receptions"].replace(0, float("nan"))
+        player_stats_df["catch_rate"] = player_stats_df["receptions"] / player_stats_df["targets"].replace(0, float("nan"))
+        player_stats_df["yards_per_target"] = player_stats_df["receiving_yards"] / player_stats_df["targets"].replace(0, float("nan"))
         player_stats_df["wopr"] = (1.5 * player_stats_df.get("target_share", 0)) + (0.7 * player_stats_df.get("air_yards_share", 0))
         player_stats_df["tgt_per_game"] = player_stats_df["targets"] / player_stats_df["games"].replace(0, float("nan"))
-        player_stats_df["catch_rate"] = player_stats_df["receptions"] / player_stats_df["targets"].replace(0, float("nan"))
+        
         player_stats_df["fantasy_ppg_ppr"] = player_stats_df["fantasy_points_ppr"] / player_stats_df["games"].replace(0, float("nan"))
         player_stats_df["fantasy_ppg_half"] = (player_stats_df.get("fantasy_points", player_stats_df["fantasy_points_ppr"] * 0.9)) / player_stats_df["games"].replace(0, float("nan"))
         player_stats_df["completion_pct"] = player_stats_df["completions"] / player_stats_df["attempts"].replace(0, float("nan"))
 
-        # print(player_stats_df.size)
-        # print("DROPPING DUPLICATES")
-        # player_stats_df = player_stats_df.drop_duplicates()
-        # print(player_stats_df.size)
         records = [
             NFLSeasonStats(
                 player_id=str(row["player_id"]),
@@ -196,12 +201,12 @@ class NFLIngestion:
         """Aggregate snap % per player per season from weekly snap data."""
         try:
             snaps = nfl.import_snap_counts(years)
+            snaps = self.player_ids.merge(snaps, on=["pfr_player_id"], how="inner")
             snap_agg = (
                 snaps[snaps["position"].isin(self.SKILL_POSITIONS)]
-                .groupby(["pfr_player_id", "season"])
+                .groupby(["player_id", "season"])
                 .agg(snap_pct=("offense_pct", "mean"))
                 .reset_index()
-                .rename(columns={"pfr_player_id": "player_id"})
             )
             return snap_agg
         except Exception as e:
@@ -243,7 +248,7 @@ class NFLIngestion:
 
         for stat_type in ("passing", "rushing", "receiving"):
             try:
-                raw = nfl.import_ngs_data(stat_type, ngs_years)
+                raw = nfl.import_ngs_data(stat_type, ngs_years).rename(columns={"player_gsis_id": "player_id"})
                 records = self._parse_ngs(raw, stat_type)
                 self._bulk_upsert(NFLAdvancedStats, records, conflict_column=("player_id", "season", "stat_type"))
                 logger.info(f"  → {len(records)} NGS {stat_type} rows ingested.")
@@ -260,7 +265,7 @@ class NFLIngestion:
 
         records = []
         for _, row in raw.iterrows():
-            pid = str(row.get("player_gsis_id") or row.get("player_id", ""))
+            pid = row.get("player_id", None)
             if not pid:
                 continue
 
@@ -279,7 +284,7 @@ class NFLIngestion:
             elif stat_type == "rushing":
                 r.efficiency = row.get("efficiency")
                 r.avg_time_to_los = row.get("avg_time_to_los")
-                r.expected_yards = row.get("expected_rushing_yards")
+                r.expected_yards = row.get("expected_rush_yards")
                 r.rush_yards_over_expected = row.get("rush_yards_over_expected")
                 r.rush_yards_over_expected_per_att = row.get("rush_yards_over_expected_per_att")
                 r.percent_attempts_gte_eight_defenders = row.get("percent_attempts_gte_eight_defenders")
@@ -304,6 +309,7 @@ class NFLIngestion:
         logger.info(f"Ingesting weekly snap counts for {years}...")
         try:
             raw = nfl.import_snap_counts(years)
+            raw = self.player_ids.merge(raw, on=["pfr_player_id"], how="inner")
             raw = raw[raw["position"].isin(self.SKILL_POSITIONS)].copy()
         except Exception as e:
             logger.warning(f"Snap counts failed: {e}")
@@ -311,7 +317,7 @@ class NFLIngestion:
 
         records = [
             NFLWeeklySnaps(
-                player_id=str(row.get("pfr_player_id", "")),
+                player_id=str(row.get("player_id", "")),
                 season=int(row["season"]),
                 week=int(row["week"]),
                 game_id=row.get("game_id"),
@@ -319,6 +325,7 @@ class NFLIngestion:
                 offense_snaps=_safe_int(row.get("offense_snaps")),
                 offense_pct=row.get("offense_pct"),
                 defense_snaps=_safe_int(row.get("defense_snaps")),
+                defense_pct=_safe_int(row.get("defense_pct")),
                 st_snaps=_safe_int(row.get("st_snaps")),
             )
             for _, row in raw.iterrows()
@@ -338,14 +345,15 @@ class NFLIngestion:
         """
         logger.info(f"Ingesting injury records for {years}...")
         try:
-            raw = nfl.import_injuries(years)
+            raw = nfl.import_injuries(years).rename(columns={"gsis_id": "player_id"})
+            raw = self.player_ids.merge(raw, on=["player_id"], how="inner")
         except Exception as e:
             logger.warning(f"Injury data failed: {e}")
             return
 
         records = [
             InjuryRecord(
-                player_id=str(row.get("gsis_id") or row.get("player_id", "")),
+                player_id=str(row.get("player_id", "")),
                 season=int(row["season"]),
                 week=int(row["week"]),
                 team=row.get("team"),
@@ -354,7 +362,7 @@ class NFLIngestion:
                 primary_injury=row.get("primary_injury"),
             )
             for _, row in raw.iterrows()
-            if row.get("gsis_id") or row.get("player_id")
+            if row.get("player_id")
         ]
 
         self._bulk_upsert(InjuryRecord, records, conflict_column=None)
