@@ -52,6 +52,32 @@ class CollegeIngestion:
     COLLEGE_POSITIONS = {"QB", "RB", "WR", "TE"}
     STAT_CATEGORIES = ["passing", "rushing", "receiving"]
 
+    PLAYER_STATS = {
+        'passing': {
+            'ATT': 'pass_attempts',
+            'COMPLETIONS': 'pass_completions',
+            'INT': 'interceptions',
+            'PCT': 'completion_pct',
+            'TD': 'pass_tds',
+            'YDS': 'pass_yds',
+            'YPA': 'yards_per_attempt'
+            },
+        'rushing': {
+            'CAR': 'rush_attempts',
+            'LONG': 'longest_rush_attempt',
+            'TD': 'rush_tds',
+            'YDS': 'rush_yds',
+            'YPC': 'yards_per_carry'
+        },
+        'receiving': {
+            'LONG': 'longest_reception',
+            'REC': 'receptions',
+            'TD': 'receiving_tds',
+            'YDS': 'receiving_yds',
+            'YPR': 'yards_per_reception',
+        }
+    }
+
     def __init__(self, engine, api_key: Optional[str] = None):
         self.engine = engine
         if not api_key:
@@ -100,14 +126,24 @@ class CollegeIngestion:
         """
         for year in years:
             logger.info(f"Ingesting college stats for {year}...")
-            self._ingest_year(year)
-            time.sleep(0.5)  # be polite to the API
-            # try:
-            #     self._ingest_year(year)
-            #     time.sleep(0.5)  # be polite to the API
-            # except Exception as e:
-            #     logger.warning(f"Failed for {year}: {e}")
+            try:
+                self._ingest_year(year)
+                time.sleep(0.5)  # be polite to the API
+            except Exception as e:
+                logger.warning(f"Failed for {year}: {e}")
     
+    # Coerce team stat wrapper types (e.g. TeamStatStatValue) to numeric safely
+    def _unwrap_stat(self, val):
+        # If it's the cfbd model wrapper, get actual_instance; otherwise use value directly
+        try:
+            inner = getattr(val, "actual_instance", val)
+            return float(inner) if inner is not None else 0.0
+        except Exception:
+            try:
+                return float(val)
+            except Exception:
+                return 0.0
+                
     def _ingest_year(self, year: int):
         """
         Pull all player stats and team stats for one year, compute context, store
@@ -118,34 +154,35 @@ class CollegeIngestion:
 
         # ---- Player stats ----
         # CFBD returns stats by category. We pull each one separately.
-        stats = []
+        stats_dict = {}
         for category in self.STAT_CATEGORIES:
             try:
                 player_stats = self.stats_api.get_player_season_stats(
                     year=year, category=category
                 )
-                for stat in player_stats:
-                    stats.append((category, stat))
+                stats_dict[category] = player_stats
             except Exception as e:
                 logger.warning(f"{category} stats for {year} failed: {e}")
             
         # Group by (player, team) and merge all categories
         player_data: dict = {}  # key: (player_id, team)
-        for category, stat in stats:
-            key = (stat.player_id, stat.team)
-            if key not in player_data:
-                player_data[key] = {
-                    "cfbd_player_id": stat.player_id,
-                    "player_name": stat.player,
-                    "team": stat.team,
-                    "season": year,
-                    "conference": None,
-                    "position": None,
-                }
-            self._merge_stat_row(player_data[key], category, stat)
+        for category, player_stats_lst in stats_dict.items():
+            i = 0
+            for player_stat in player_stats_lst:
+                key = (player_stat.player_id, player_stat.team)
+                if key not in player_data:
+                    player_data[key] = {
+                        "cfbd_player_id": player_stat.player_id,
+                        "player_name": player_stat.player,
+                        "team": player_stat.team,
+                        "season": year,
+                        "conference": player_stat.conference,
+                        "position": player_stat.position,
+                    }
+                self._merge_stat_row(player_data[key], category, player_stat)
         
         # Enrich with conference and position from player search
-        self._enrich_player_metadata(player_data, year)
+        # self._enrich_player_metadata(player_data, year)
 
         # Build ORM records and bulk upsert
         records_created = 0
@@ -171,40 +208,25 @@ class CollegeIngestion:
                 context[team] = {}
             stat_name = team_info.stat_name
             # Accumulate relevant team totals
-            if stat_name == "passingYards":
-                context[team]["team_pass_yards"] = team_info.stat_value
+            if stat_name == "netPassingYards":
+                context[team]["team_pass_yards"] = self._unwrap_stat(team_info.stat_value)
+                context[team]["team_rec_yards"] = self._unwrap_stat(team_info.stat_value)
             elif stat_name == "passingTDs":
-                context[team]["team_pass_tds"] = team_info.stat_value
-            elif stat_name == "receivingYards":
-                context[team]["team_rec_yards"] = team_info.stat_value
-            elif stat_name == "receivingTDs":
-                context[team]["team_rec_tds"] = team_info.stat_value
+                context[team]["team_pass_tds"] = self._unwrap_stat(team_info.stat_value)
+                context[team]["team_rec_tds"] = self._unwrap_stat(team_info.stat_value)
         return context
     
     def _merge_stat_row(self, data: dict, category: str, row) -> None:
         """
         Merge a single stat category row into the player's data dict
         """
-        if category == "passing":
-            data.update({
-                "pass_completions": getattr(row, "completions", None),
-                "pass_attempts": getattr(row, "att", None),
-                "pass_yards": getattr(row, "yds", None),
-                "pass_tds": getattr(row, "td", None),
-                "interceptions": getattr(row, "int", None),
-            })
-        elif category == "rushing":
-            data.update({
-                "rush_carries": getattr(row, "car", None),
-                "rush_yards": getattr(row, "yds", None),
-                "rush_tds": getattr(row, "td", None),
-            })
-        elif category == "receiving":
-            data.update({
-                "receptions": getattr(row, "rec", None),
-                "rec_yards": getattr(row, "yds", None),
-                "rec_tds": getattr(row, "td", None),
-            })
+        stat_types = self.PLAYER_STATS[category]
+        stat_type = row.stat_type
+        stat_val = row.stat
+
+        data.update(
+            {stat_types[stat_type]: float(stat_val) if '.' in stat_val else int(stat_val)}
+        )
     
     def _enrich_player_metadata(self, player_data: dict, year: int):
         """
@@ -245,32 +267,12 @@ class CollegeIngestion:
         rush_yards = data.get("rush_yards", 0) or 0
         rush_carries = data.get("rush_carries", 1) or 1
         rush_tds = data.get("rush_tds", 0) or 0
-
-        # Coerce team stat wrapper types (e.g. TeamStatStatValue) to numeric safely
-        def _unwrap_stat(val):
-            # If it's the cfbd model wrapper, get actual_instance; otherwise use value directly
-            try:
-                inner = getattr(val, "actual_instance", val)
-                return float(inner) if inner is not None else 0.0
-            except Exception:
-                try:
-                    return float(val)
-                except Exception:
-                    return 0.0
         
         # Team totals (CFBD provides passing and receiving totals; rushing may not be present)
-        team_pass_y = _unwrap_stat(team_ctx.get("team_pass_yards"))
-        team_pass_t = _unwrap_stat(team_ctx.get("team_pass_tds"))
-        team_rec_y = _unwrap_stat(team_ctx.get("team_rec_yards"))
-        team_rec_t = _unwrap_stat(team_ctx.get("team_rec_tds"))
-
-        # Player totals
-        player_pass_y = data.get("pass_yards") or 0
-        player_pass_t = data.get("pass_tds") or 0
-        player_rec_y = rec_yards or 0
-        player_rec_t = rec_tds or 0
-        player_rush_y = rush_yards or 0
-        player_rush_t = rush_tds or 0
+        team_pass_y = team_ctx.get("team_pass_yards")
+        team_pass_t = team_ctx.get("team_pass_tds")
+        team_rec_y = team_ctx.get("team_rec_yards")
+        team_rec_t = team_ctx.get("team_rec_tds")
 
         pass_attempts = data.get("pass_attempts")
         if pass_attempts is None or pass_attempts == 0:
@@ -281,17 +283,6 @@ class CollegeIngestion:
                 completion_pct = pass_completions / pass_attempts
             else:
                 completion_pct = 0
-
-        # Team total yards for dominator denominator: use pass + rec as available
-        team_total_yards = max(team_pass_y + team_rec_y, 1)
-        team_total_tds = max(team_pass_t + team_rec_t, 1)
-
-        # Yards dominator: share of team yards (rush+rec+pass) vs available team totals
-        yards_share = (player_pass_y + player_rec_y + player_rush_y) / team_total_yards
-        # TD dominator: share of team TDs (pass TDs + rec TDs + rush TDs) vs available team totals
-        td_share = (player_pass_t + player_rec_t + player_rush_t) / team_total_tds
-        # Combined dominator (0-1)
-        dominator_score = max(0.0, min(1.0, (yards_share + td_share) / 2.0))
 
         return CollegeSeasonStats(
             cfbd_player_id=data["cfbd_player_id"],
@@ -322,11 +313,7 @@ class CollegeIngestion:
             team_pass_yards=team_pass_y,
             team_pass_tds=team_pass_t,
             team_rec_yards=team_rec_y,
-            team_rec_tds=team_rec_t,
-            # Dominator metrics
-            dominatory_yards=yards_share,
-            dominator_tds=td_share,
-            dominator_score=dominator_score
+            team_rec_tds=team_rec_t
         )
     
     # ------------------------------------------------------------------
@@ -356,7 +343,7 @@ class CollegeIngestion:
             vertical = _safe_float(row.get("vertical"))
             broad = _safe_float(row.get("broad_jump"))
             bench = _safe_float(row.get("bench"))
-            cone = _safe_float(row.get("3cone"))
+            cone = _safe_float(row.get("cone"))
             shuttle = _safe_float(row.get("shuttle"))
 
             bmi = (weight / (height_in ** 2) * 703) if (height_in and weight) else None
@@ -365,6 +352,7 @@ class CollegeIngestion:
             speed_score = _calc_speed_score(weight, forty)
 
             records.append(CombineMeasurements(
+                player_id=row.get("player_id"),
                 player_name=row.get("player_name"),
                 draft_year=_safe_int(row.get("draft_year")),
                 position=row.get("position"),
@@ -401,19 +389,20 @@ class CollegeIngestion:
         """
         logger.info("Ingesting NFL draft history...")
         try:
-            raw_draft_data = nfl.import_draft_picks(list(range(1970, 2026)))
+            raw_draft_data = nfl.import_draft_picks(list(range(2000, 2026)))
         except Exception as e:
             logger.warning(f"Draft data failed: {e}")
             return
 
         raw_draft_data = raw_draft_data[raw_draft_data["position"].isin(self.COLLEGE_POSITIONS)].copy()
+        raw_draft_data = self.player_ids.merge(raw_draft_data, on=['pfr_player_id'], how='inner')
 
         with get_session(self.engine) as session:
             for _, row in raw_draft_data.iterrows():
-                gsis_id = str(row.get("gsis_id") or "")
-                if not gsis_id:
+                player_id = str(row.get("player_id") or "")
+                if not player_id:
                     continue
-                player = session.get(Player, gsis_id)
+                player = session.get(Player, player_id)
                 if player:
                     player.draft_round = _safe_int(row.get("round"))
                     player.draft_pick = _safe_int(row.get("pick"))
@@ -445,6 +434,7 @@ def _calc_sparq(weight, forty, vertical, broad, shuttle) -> Optional[float]:
             + (20 / shuttle)             # agility
         )
     except (ZeroDivisionError, TypeError):
+        logger.warning(f"SPARQ calculation failed for weight={weight}, forty={forty}, vertical={vertical}, broad={broad}, shuttle={shuttle}")
         return None
 
 
@@ -488,6 +478,7 @@ def _calc_speed_score(weight: Optional[float], forty: Optional[float]) -> Option
     try:
         return (weight * 200) / (forty ** 4)
     except ZeroDivisionError:
+        logger.warning(f"Speed Score calculation failed for weight={weight}, forty={forty}")
         return None
 
 # ------------------------------------------------------------------

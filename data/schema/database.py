@@ -120,7 +120,7 @@ class NFLSeasonStats(Base):
     season_type     = Column(String, default="REG")     # REG, POST
     team            = Column(String)
     games           = Column(Integer)
-    games_started   = Column(Integer)
+    # games_started   = Column(Integer)
 
     # Passing
     completions     = Column(Integer)
@@ -317,11 +317,6 @@ class CollegeSeasonStats(Base):
     team_pass_tds   = Column(Integer)
     team_rec_yards  = Column(Integer)
     team_rec_tds    = Column(Integer)
-
-    # Dominator ratings (player's share of team production)
-    dominatory_yards = Column(Float)
-    dominator_tds    = Column(Float)
-    dominator_score  = Column(Float)
 
     player = relationship("Player", back_populates="college_stats")
 
