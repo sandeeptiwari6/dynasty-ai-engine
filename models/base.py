@@ -9,6 +9,8 @@ import pandas as pd
 import joblib
 import mlflow
 
+from utils.constants import _FEATURE_DISPLAY_NAMES
+
 logger = logging.getLogger(__name__)
 
 # Where trained model artifacts are saved locally
@@ -230,53 +232,6 @@ class DynastyModel(ABC):
             if len(positive) >= n and len(negative) >= n:
                 break
         return positive[:n], negative[:n]
-
-# ------------------------------------------------------------------
-# Feature display name mapping (for human-readable SHAP output)
-# ------------------------------------------------------------------
-
-_FEATURE_DISPLAY_NAMES = {
-    "fantasy_ppg_last_season": "Last season PPG",
-    "fantasy_ppg_3yr_avg": "3-year avg PPG",
-    "fantasy_ppg_trend": "PPG trend (slope)",
-    "target_share": "Target share",
-    "air_yards_share": "Air yards share",
-    "wopr": "WOPR",
-    "snap_pct": "Snap %",
-    "snap_pct_trend": "Snap % trend",
-    "carries_per_game": "Carries/game",
-    "targets_per_game": "Targets/game",
-    "yards_per_target": "Yards/target",
-    "yards_per_carry": "Yards/carry",
-    "racr": "RACR",
-    "epa_per_play": "EPA/play",
-    "cpoe": "CPOE",
-    "ryoe_per_att": "RYOE/att",
-    "separation_avg": "Avg separation (yards)",
-    "catch_pct_above_expected": "CPOE (receiver)",
-    "games_missed_last_season": "Games missed (last season)",
-    "games_missed_2yr_total": "Games missed (2yr)",
-    "injury_risk_score": "Injury risk score",
-    "soft_tissue_injury_flag": "Soft tissue injury history",
-    "acl_history_flag": "ACL history",
-    "age": "Age",
-    "age_vs_position_peak": "Years from position peak",
-    "years_experience": "NFL experience (yrs)",
-    "team_pass_rate": "Team pass rate",
-    "team_pass_rate_neutral": "Team pass rate (neutral script)",
-    "new_team_flag": "Changed teams",
-    "new_oc_flag": "New offensive coordinator",
-    "scheme_fit_score": "Scheme fit score",
-    "offensive_line_rank": "Offensive line rank",
-    "dominator_rating": "College dominator rating",
-    "breakout_age": "College breakout age",
-    "sparq_score": "SPARQ score",
-    "relative_athletic_score": "RAS",
-    "speed_score": "Speed score",
-    "draft_round": "Draft round",
-    "draft_pick_normalized": "Draft capital",
-}
-
 
 def _format_feature_value(feature_name: str, value: float) -> str:
     """Format a feature value as a readable string for factor explanations."""

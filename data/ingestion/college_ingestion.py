@@ -7,11 +7,14 @@ import pandas as pd
 
 import cfbd
 import nfl_data_py as nfl
+from sqlalchemy import text
 
 from data.schema.database import (
-    CollegeSeasonStats, CombineMeasurements, Player,
+    CollegeSeasonStats, CombineMeasurements, Player, CollegeGamesPlayed,
     get_session
 )
+
+from utils.constants import NORMALIZED_PLAYER_NAMES, MOST_FREQUENT_TEAMS
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +102,24 @@ class CollegeIngestion:
         self.stats_api = cfbd.StatsApi(self.cfbd_client)
         self.players_api = cfbd.PlayersApi(self.cfbd_client)
         self.teams_api = cfbd.TeamsApi(self.cfbd_client)
-    
-    def run_full_backfill(self, start_year: int = 2010, end_year: Optional[int] = None):
+        self.games_api = cfbd.GamesApi(self.cfbd_client)
+
+        ids = nfl.import_ids()
+        self.player_ids = (
+            ids[['gsis_id', 'pfr_id']][~ids['gsis_id'].isna()]
+            .rename(columns={'gsis_id': 'player_id', 'pfr_id': 'pfr_player_id'})
+            # .drop_duplicates(subset=['player_id'])
+            .drop_duplicates(subset=["pfr_player_id"])
+        )
+        self.player_ids = self.player_ids[~self.player_ids["pfr_player_id"].isna()]
+
+    def run_full_backfill(
+            self, 
+            start_year: int = 2010, 
+            end_year: Optional[int] = None, 
+            use_cached_data: bool = True, 
+            overwrite: bool = False
+        ):
         """
         Master method — runs college + combine ingestion.
         Pull college data 2010+ gives us roughly 15 years of draft prospects
@@ -110,9 +129,18 @@ class CollegeIngestion:
         years = list(range(start_year, end_year + 1))
 
         logger.info(f"Starting college backfill {years[0]}–{years[-1]}")
+
+        self.games_played_dict = self._load_games_played_data(cached=use_cached_data, start_year=start_year)
+
+        if overwrite:
+            CollegeSeasonStats.__table__.drop(self.engine, checkfirst=True)
+            CollegeSeasonStats.metadata.create_all(self.engine)
+            CombineMeasurements.__table__.drop(self.engine, checkfirst=True)
+            CombineMeasurements.metadata.create_all(self.engine)
+
         self.ingest_college_season_stats(years)
         self.ingest_combine_measurements()
-        self.ingest_draft_history()
+        self.ingest_draft_history(start_year, end_year)
         logger.info("  → College backfill complete.")
     
     # ------------------------------------------------------------------
@@ -143,6 +171,89 @@ class CollegeIngestion:
                 return float(val)
             except Exception:
                 return 0.0
+    
+    def calc_player_games_played_by_team(self, team_name, season):
+        logger.info(f"    → Calculating games played for {team_name} in {season}...")
+        game_player_stats = self.games_api.get_game_player_stats(
+            year=season,
+            team=team_name
+        )
+        player_games_appeared = {}
+        
+        for game in game_player_stats:
+            try:
+                teams = game.to_dict()['teams']
+                team_stats = [team for team in teams if team['team'] == team_name][0]
+                categories = team_stats['categories']
+                players_seen = set()
+                for category in categories:
+                    cat_types = category['types']
+                    for cat_type in cat_types:
+                        athletes = cat_type['athletes']
+                        for athlete in athletes:
+                            players_seen.add(athlete['id'])
+        
+                for player_seen in players_seen:
+                    player_games_appeared[player_seen] = player_games_appeared.get(player_seen, 0) + 1
+            except Exception as e:
+                logger.warning(f"Failed to process game stats for {team_name} in {season}: {e}")
+                continue
+        games_played_data = [
+            {
+                'player_id': player_id, 
+                'season': season,
+                'games_played': games_played
+            } for player_id, games_played in player_games_appeared.items()
+        ]
+
+        return pd.DataFrame(games_played_data)
+    
+    def _load_games_played_data(self, cached, start_year: int = 2010) -> pd.DataFrame:
+        """
+        Load or compute games played data for all players by team and season.
+        CFBD doesn't provide a clean "games played" stat, so we derive it from game logs.
+        Caches to avoid repeated API calls.
+        """
+
+        if not cached:
+            end_year = pd.Timestamp.now().year
+
+            with get_session(self.engine) as session:
+                for team in MOST_FREQUENT_TEAMS:
+                    for year in range(start_year, end_year + 1):
+                        games_played_df = self.calc_player_games_played_by_team(team, year)
+
+                        for idx, row in games_played_df.iterrows():
+                            try:
+                                record = CollegeGamesPlayed(
+                                    cfbd_player_id=row['player_id'],
+                                    season=int(row['season']),
+                                    games_played=int(row['games_played'])
+                                )
+                                session.merge(record)
+                                session.commit()
+                            except Exception as e:
+                                session.rollback()
+                                logger.warning(f"Failed to upsert games played for player {row['player_id']} in {year}: {e}")
+                        time.sleep(0.5)  # throttle to avoid hitting API limits
+            logger.info("Games played data calculated and cached.")
+
+        query = f"""
+            SELECT *
+            FROM college_games_played
+            WHERE season >= {start_year}
+        """
+        with self.engine.connect() as conn:
+            games_played_df = pd.read_sql(text(query), conn)
+
+            games_played_dict = {}
+            for _, row in games_played_df.iterrows():
+                player_id = str(row["cfbd_player_id"])
+                if player_id not in games_played_dict:
+                    games_played_dict[player_id] = {}
+                games_played_dict[player_id][int(row["season"])] = int(row["games_played"])
+
+        return games_played_dict
                 
     def _ingest_year(self, year: int):
         """
@@ -167,17 +278,18 @@ class CollegeIngestion:
         # Group by (player, team) and merge all categories
         player_data: dict = {}  # key: (player_id, team)
         for category, player_stats_lst in stats_dict.items():
-            i = 0
             for player_stat in player_stats_lst:
-                key = (player_stat.player_id, player_stat.team)
+                team, player_id = player_stat.team, player_stat.player_id
+                key = (player_id, team)
                 if key not in player_data:
                     player_data[key] = {
-                        "cfbd_player_id": player_stat.player_id,
+                        "cfbd_player_id": player_id,
                         "player_name": player_stat.player,
-                        "team": player_stat.team,
+                        "team": team,
                         "season": year,
                         "conference": player_stat.conference,
                         "position": player_stat.position,
+                        "games_played": self.games_played_dict.get(player_id, {}).get(int(year), 0)  # get games played from precomputed dict
                     }
                 self._merge_stat_row(player_data[key], category, player_stat)
         
@@ -259,35 +371,12 @@ class CollegeIngestion:
         """Build a CollegeSeasonStats ORM record, including dominator components."""
         if not data.get("cfbd_player_id"):
             return None
-
-        receptions = data.get("receptions", 0) or 0
-        rec_yards = data.get("rec_yards", 0) or 0
-        rec_tds = data.get("rec_tds", 0) or 0
-
-        rush_yards = data.get("rush_yards", 0) or 0
-        rush_carries = data.get("rush_carries", 1) or 1
-        rush_tds = data.get("rush_tds", 0) or 0
         
-        # Team totals (CFBD provides passing and receiving totals; rushing may not be present)
-        team_pass_y = team_ctx.get("team_pass_yards")
-        team_pass_t = team_ctx.get("team_pass_tds")
-        team_rec_y = team_ctx.get("team_rec_yards")
-        team_rec_t = team_ctx.get("team_rec_tds")
-
-        pass_attempts = data.get("pass_attempts")
-        if pass_attempts is None or pass_attempts == 0:
-            completion_pct = 0
-        else:
-            pass_completions = data.get("pass_completions")
-            if pass_completions:
-                completion_pct = pass_completions / pass_attempts
-            else:
-                completion_pct = 0
-
+        player_name = data.get("player_name")
         return CollegeSeasonStats(
             cfbd_player_id=data["cfbd_player_id"],
-            player_name=data.get("player_name"),
-            season=data["season"],
+            player_name=NORMALIZED_PLAYER_NAMES.get(player_name) or player_name,
+            season=data.get("season"),
             team=data.get("team"),
             position=data.get("position"),
             conference=data.get("conference"),
@@ -295,25 +384,25 @@ class CollegeIngestion:
             # Passing
             pass_completions=data.get("pass_completions"),
             pass_attempts=data.get("pass_attempts"),
-            pass_yards=data.get("pass_yards"),
-            pass_tds=data.get("pass_tds"),
-            interceptions=data.get("interceptions"),
-            completion_pct=completion_pct,
+            pass_yards=data.get("pass_yds", 0),
+            pass_tds=data.get("pass_tds", 0),
+            interceptions=data.get("interceptions", 0),
+            completion_pct=data.get("completion_pct"),
             # Rushing
-            rush_carries=data.get("rush_carries"),
-            rush_yards=rush_yards,
-            rush_tds=data.get("rush_tds"),
-            rush_yards_per_carry=rush_yards / rush_carries if rush_carries else None,
+            rush_carries=data.get("rush_attempts"),
+            rush_yards=data.get("rush_yds", 0),
+            rush_tds=data.get("rush_tds", 0),
+            rush_yards_per_carry=data.get("yards_per_carry"),
             # Receiving
             receptions=data.get("receptions"),
-            rec_yards=rec_yards,
-            rec_tds=rec_tds,
-            yards_per_rec=rec_yards / max(receptions, 1),
+            rec_yards=data.get("receiving_yds", 0),
+            rec_tds=data.get("receiving_tds", 0),
+            yards_per_rec=data.get("yards_per_reception"),
             # Team context (needed for dominator rating feature engineering)
-            team_pass_yards=team_pass_y,
-            team_pass_tds=team_pass_t,
-            team_rec_yards=team_rec_y,
-            team_rec_tds=team_rec_t
+            team_pass_yards=team_ctx.get("team_pass_yards"),
+            team_pass_tds=team_ctx.get("team_pass_tds"),
+            team_rec_yards=team_ctx.get("team_rec_yards"),
+            team_rec_tds=team_ctx.get("team_rec_tds")
         )
     
     # ------------------------------------------------------------------
@@ -330,7 +419,9 @@ class CollegeIngestion:
             raw_combine_data = nfl.import_combine_data(
                 years=list(range(2000, 2026)),
                 positions=list(self.COLLEGE_POSITIONS)
-            )
+            ).rename(columns={'pfr_id': 'pfr_player_id'}).drop_duplicates(subset=['pfr_player_id', 'cfb_id'])
+            raw_combine_data = raw_combine_data[~raw_combine_data["draft_year"].isna()]
+            raw_combine_data = self.player_ids.merge(raw_combine_data, on=['pfr_player_id'], how='inner')
         except Exception as e:
             logger.warning(f"Combine data failed: {e}")
             return
@@ -339,7 +430,7 @@ class CollegeIngestion:
         for _, row in raw_combine_data.iterrows():
             height_in = _parse_height(row.get("ht"))
             weight = _safe_float(row.get("wt"))
-            forty = _safe_float(row.get("40yd"))
+            forty = _safe_float(row.get("forty"))
             vertical = _safe_float(row.get("vertical"))
             broad = _safe_float(row.get("broad_jump"))
             bench = _safe_float(row.get("bench"))
@@ -355,8 +446,8 @@ class CollegeIngestion:
                 player_id=row.get("player_id"),
                 player_name=row.get("player_name"),
                 draft_year=_safe_int(row.get("draft_year")),
-                position=row.get("position"),
-                school=row.get("school_name"),
+                position=row.get("pos"),
+                school=row.get("school"),
                 height=_safe_int(height_in),
                 weight=_safe_int(weight),
                 forty_yard=forty,
@@ -382,20 +473,20 @@ class CollegeIngestion:
     # Draft history — enriches Player table
     # ------------------------------------------------------------------
 
-    def ingest_draft_history(self):
+    def ingest_draft_history(self, start_year: int, end_year: int):
         """
         Pull historical NFL draft picks and enrich the Player table
         with draft round, pick, and year. Critical for prospect modeling.
         """
         logger.info("Ingesting NFL draft history...")
-        try:
-            raw_draft_data = nfl.import_draft_picks(list(range(2000, 2026)))
+        try: 
+            raw_draft_data = nfl.import_draft_picks(list(range(2000, max(end_year + 1, 2001)))).rename(columns={'gsis_id': 'player_id'}).drop_duplicates(subset=['player_id', 'season'])
         except Exception as e:
             logger.warning(f"Draft data failed: {e}")
             return
 
         raw_draft_data = raw_draft_data[raw_draft_data["position"].isin(self.COLLEGE_POSITIONS)].copy()
-        raw_draft_data = self.player_ids.merge(raw_draft_data, on=['pfr_player_id'], how='inner')
+        raw_draft_data = self.player_ids.merge(raw_draft_data, on=['player_id', "pfr_player_id"], how='inner')
 
         with get_session(self.engine) as session:
             for _, row in raw_draft_data.iterrows():
@@ -406,7 +497,7 @@ class CollegeIngestion:
                 if player:
                     player.draft_round = _safe_int(row.get("round"))
                     player.draft_pick = _safe_int(row.get("pick"))
-                    player.draft_year = _safe_int(row.get("year"))
+                    player.draft_year = _safe_int(row.get("season"))
                     player.draft_team = row.get("team")
                     player.college_team = row.get("college")
             session.commit()

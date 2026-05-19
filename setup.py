@@ -27,6 +27,7 @@ setup(
         'jupyter>=1.0.0',
         'matplotlib>=3.7.0',
         'seaborn>=0.12.0',
-        'mlflow>=2.12.0'
+        'mlflow>=2.12.0',
+        'rapidfuzz'
     ],
 )

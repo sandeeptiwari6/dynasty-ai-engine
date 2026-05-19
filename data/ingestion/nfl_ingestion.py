@@ -8,8 +8,11 @@ import nfl_data_py as nfl
 
 from data.schema.database import (
     Player, NFLSeasonStats, NFLAdvancedStats,
-    NFLWeeklySnaps, InjuryRecord, get_session
+    NFLWeeklySnaps, InjuryRecord, NFLTeam, get_session
 )
+
+from utils.constants import COACHING_DATA, _COACHING_FALLBACK, TEAM_FULL_NAMES, NORMALIZED_PLAYER_NAMES
+from utils.helpers import _bulk_upsert, _safe_date, _safe_int, _compute_ol_rank, _compute_points_per_game, _count_games_per_team
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +49,13 @@ class NFLIngestion:
         self.engine = engine
 
         ids = nfl.import_ids()
-        self.player_ids = ids[['gsis_id', 'pfr_id']][~ids['gsis_id'].isna()].rename(columns={'gsis_id': 'player_id', 'pfr_id': 'pfr_player_id'}).drop_duplicates(subset=['player_id'])
+        self.player_ids = (
+            ids[['gsis_id', 'pfr_id']][~ids['gsis_id'].isna()]
+            .rename(columns={'gsis_id': 'player_id', 'pfr_id': 'pfr_player_id'})
+            .drop_duplicates(subset=['player_id'])
+        )
 
-    def run_full_backfill(self, start_year: int = 2015, end_year: Optional[int] = None):
+    def run_full_backfill(self, start_year: int = 2015, end_year: Optional[int] = None, overwrite: bool = False):
         """
         Master method — runs all ingestion steps in order.
         Pulls everything from start_year to present.
@@ -60,11 +67,26 @@ class NFLIngestion:
 
         logger.info(f"Starting NFL backfill for {years[0]}–{years[-1]}")
 
+        if overwrite:
+            Player.__table__.drop(self.engine, checkfirst=True)
+            Player.metadata.create_all(self.engine)
+            NFLSeasonStats.__table__.drop(self.engine, checkfirst=True)
+            NFLSeasonStats.metadata.create_all(self.engine)
+            NFLAdvancedStats.__table__.drop(self.engine, checkfirst=True)
+            NFLAdvancedStats.metadata.create_all(self.engine)
+            NFLWeeklySnaps.__table__.drop(self.engine, checkfirst=True)
+            NFLWeeklySnaps.metadata.create_all(self.engine)
+            InjuryRecord.__table__.drop(self.engine, checkfirst=True)
+            InjuryRecord.metadata.create_all(self.engine)
+            NFLTeam.__table__.drop(self.engine, checkfirst=True)
+            NFLTeam.metadata.create_all(self.engine)
+
         self.ingest_players()
         self.ingest_seasonal_stats(years)
         self.ingest_advanced_stats(years)
         self.ingest_snap_counts(years)
         self.ingest_injuries(years)
+        self.ingest_team_context(years)
 
         logger.info("NFL backfill complete.")
     
@@ -86,11 +108,12 @@ class NFLIngestion:
 
         players = []
         for _, row in raw.iterrows():
+            player_name = row.get("display_name") or f"{row.get('first_name','')} {row.get('last_name','')}".strip()
             player = Player(
                 player_id=str(row.get("player_id") or row.get("gsis_id", "")),
                 gsis_id=str(row.get("gsis_id", "")),
                 sleeper_id=str(row.get("sleeper_id", "")) if pd.notna(row.get("sleeper_id")) else None,
-                name=row.get("display_name") or f"{row.get('first_name','')} {row.get('last_name','')}".strip(),
+                name=NORMALIZED_PLAYER_NAMES.get(player_name) or player_name,
                 first_name=row.get("first_name"),
                 last_name=row.get("last_name"),
                 position=row.get("position"),
@@ -101,18 +124,18 @@ class NFLIngestion:
                 height=_safe_int(row.get("height")),
                 weight=_safe_int(row.get("weight")),
                 years_exp=_safe_int(row.get("years_of_experience")),
-                rookie_year=_safe_int(row.get("rookie_year")),
+                rookie_year=_safe_int(row.get("rookie_season")),
                 draft_round=_safe_int(row.get("draft_round")),
                 draft_pick=_safe_int(row.get("draft_number")),
-                draft_team=row.get("draft_club"),
+                draft_team=row.get("draft_team"),
                 draft_year=_safe_int(row.get("entry_year")),
                 depth_chart_order=_safe_int(row.get("depth_chart_position")),
                 jersey_number=_safe_int(row.get("jersey_number")),
-                updated_at=datetime.utcnow(),
+                updated_at=datetime.now(),
             )
             players.append(player)
 
-        self._bulk_upsert(Player, players, conflict_column="player_id")
+        _bulk_upsert(self.engine, Player, players, conflict_column="player_id")
         logger.info(f"{len(players)} players ingested.")
     
     # ------------------------------------------------------------------
@@ -174,7 +197,7 @@ class NFLIngestion:
                 rushing_yards=_safe_int(row.get("rushing_yards")),
                 rushing_tds=_safe_int(row.get("rushing_tds")),
                 rushing_epa=row.get("rushing_epa"),
-                yards_per_carry=row.get("rushing_yards_per_att"),
+                yards_per_carry=row.get("rushing_yards_per_attempt"),
                 targets=_safe_int(row.get("targets")),
                 receptions=_safe_int(row.get("receptions")),
                 receiving_yards=_safe_int(row.get("receiving_yards")),
@@ -197,7 +220,7 @@ class NFLIngestion:
             for _, row in player_stats_df.iterrows()
         ]
 
-        self._bulk_upsert(NFLSeasonStats, records, conflict_column=("player_id", "season", "season_type"))
+        _bulk_upsert(self.engine, NFLSeasonStats, records, conflict_column=("player_id", "season", "season_type"))
         logger.info(f"{len(records)} seasonal stat rows ingested.")
     
     def _load_snap_pct_for_season_stats(self, years: list[int]) -> pd.DataFrame:
@@ -254,7 +277,7 @@ class NFLIngestion:
             try:
                 raw = nfl.import_ngs_data(stat_type, ngs_years).rename(columns={"player_gsis_id": "player_id"})
                 records = self._parse_ngs(raw, stat_type)
-                self._bulk_upsert(NFLAdvancedStats, records, conflict_column=("player_id", "season", "stat_type"))
+                _bulk_upsert(self.engine, NFLAdvancedStats, records, conflict_column=("player_id", "season", "stat_type"))
                 logger.info(f"  → {len(records)} NGS {stat_type} rows ingested.")
             except Exception as e:
                 logger.warning(f"NGS {stat_type} failed: {e}")
@@ -335,7 +358,7 @@ class NFLIngestion:
             for _, row in snap_df.iterrows()
         ]
 
-        self._bulk_upsert(NFLWeeklySnaps, records, conflict_column=None)  # no unique constraint here
+        _bulk_upsert(self.engine, NFLWeeklySnaps, records, conflict_column=None)  # no unique constraint here
         logger.info(f"  → {len(records)} snap count rows ingested.")
 
     # ------------------------------------------------------------------
@@ -370,56 +393,224 @@ class NFLIngestion:
             if row.get("player_id")
         ]
 
-        self._bulk_upsert(InjuryRecord, records, conflict_column=None)
+        _bulk_upsert(self.engine, InjuryRecord, records, conflict_column=None)
         logger.info(f"  → {len(records)} injury records ingested.")
+    
+    # ------------------------------------------------------------------
+    # Team context
+    # ------------------------------------------------------------------
+ 
+    def ingest_team_context(self, years: list[int]) -> None:
+        """
+        Build and store one NFLTeam row per (team, season).
+ 
+        Fields derived from play-by-play (computed here):
+          plays_per_game, pass_rate, pass_rate_neutral, team_pass_yards,
+          team_rush_yards, team_pass_attempts, team_targets, offensive_line_rank
+ 
+        Fields derived from schedules (computed here):
+          points_per_game
+ 
+        Fields from static COACHING_DATA dict (maintained manually):
+          head_coach, offensive_coordinator, defensive_coordinator, offensive_scheme
+ 
+        WHY play-by-play for pass rate (not seasonal_data):
+          Neutral pass rate — pass rate when score is within one possession —
+          is a far better proxy for offensive philosophy than raw pass rate,
+          which inflates when teams trail. We can only compute this from pbp
+          with score differential filtering.
+ 
+        WHY sack count for OL rank:
+          True OL grades (PFF) are paywalled. Sacks allowed per pass attempt
+          correlates with PFF OL grade at r≈0.65 historically. We rank teams
+          1–32 (1=best OL) by inverse sack rate as an open-source proxy.
+        """
+        logger.info(f"Ingesting team context for {years}...")
+ 
+        pbp_cols = [
+            "season", "week", "game_id", "posteam", "play_type",
+            "pass_attempt", "rush_attempt", "sack", "score_differential",
+            "passing_yards", "rushing_yards", "half_seconds_remaining",
+        ]
+        try:
+            pbp = nfl.import_pbp_data(years=years, columns=pbp_cols)
+        except Exception as e:
+            logger.error(f"Failed to load play-by-play for team context: {e}")
+            return
+ 
+        pbp = pbp[pbp["play_type"].isin(["pass", "run", "qb_kneel", "qb_spike"])].copy()
+        pbp = pbp[pbp["posteam"].notna()].copy()
+ 
+        try:
+            schedules = nfl.import_schedules(years)
+        except Exception as e:
+            logger.warning(f"Could not load schedules (points_per_game will be null): {e}")
+            schedules = pd.DataFrame()
+ 
+        try:
+            team_desc = nfl.import_team_desc()
+            team_name_map = (
+                team_desc.set_index("team_abbr")["team_name"].to_dict()
+                if "team_abbr" in team_desc.columns else {}
+            )
+        except Exception:
+            team_name_map = {}
+ 
+        records = []
+        teams = pbp["posteam"].dropna().unique()
+ 
+        for season in years:
+            season_pbp = pbp[pbp["season"] == season].copy()
+            games_per_team = _count_games_per_team(season_pbp)
+            ppg_map = _compute_points_per_game(schedules, season) if not schedules.empty else {}
+            ol_ranks = _compute_ol_rank(season_pbp)
+ 
+            for team in teams:
+                team_pbp = season_pbp[season_pbp["posteam"] == team]
+                if team_pbp.empty:
+                    continue
+ 
+                n_games = games_per_team.get(team, 1)
+                pass_plays = team_pbp[team_pbp["pass_attempt"] == 1]
+                rush_plays = team_pbp[team_pbp["rush_attempt"] == 1]
+                total_plays = len(pass_plays) + len(rush_plays)
+                pass_rate = len(pass_plays) / total_plays if total_plays > 0 else None
+ 
+                # Neutral script: score within 7pts AND not final 2 min of half
+                neutral_mask = (
+                    (team_pbp["score_differential"].abs() <= 7) &
+                    (team_pbp["half_seconds_remaining"] > 120)
+                )
+                neutral = team_pbp[neutral_mask]
+                neutral_total = neutral["pass_attempt"].sum() + neutral["rush_attempt"].sum()
+                pass_rate_neutral = (
+                    float(neutral["pass_attempt"].sum() / neutral_total)
+                    if neutral_total > 0 else pass_rate
+                )
+ 
+                # Targets = pass attempts excluding sacks
+                target_plays = pass_plays[pass_plays["sack"] != 1]
+ 
+                coaching = COACHING_DATA.get(
+                    (team, season),
+                    COACHING_DATA.get((team, season - 1), _COACHING_FALLBACK)
+                )
+ 
+                records.append(NFLTeam(
+                    team_abbr=team,
+                    season=season,
+                    full_name=team_name_map.get(team) or TEAM_FULL_NAMES.get(team) or team,
+                    head_coach=coaching["head_coach"],
+                    offensive_coordinator=coaching["offensive_coordinator"],
+                    defensive_coordinator=coaching["defensive_coordinator"],
+                    offensive_scheme=coaching["offensive_scheme"],
+                    plays_per_game=round(len(team_pbp) / n_games, 2),
+                    pass_rate=round(pass_rate, 4) if pass_rate is not None else None,
+                    pass_rate_neutral=round(pass_rate_neutral, 4) if pass_rate_neutral is not None else None,
+                    team_pass_yards=_safe_int(pass_plays["passing_yards"].sum()),
+                    team_rush_yards=_safe_int(rush_plays["rushing_yards"].sum()),
+                    team_pass_attempts=len(pass_plays),
+                    team_targets=len(target_plays),
+                    points_per_game=ppg_map.get(team),
+                    offensive_line_rank=ol_ranks.get(team),
+                ))
+ 
+        with get_session(self.engine) as session:
+            for record in records:
+                session.merge(record)
+            session.commit()
+ 
+        logger.info(f"  → {len(records)} team-season rows written to nfl_teams.")
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
-    def _bulk_upsert(self, model, records, conflict_column):
-        """
-        SQLite upsert using INSERT OR REPLACE semantics.
-        For tables with unique constraints, this updates on conflict.
-        For tables without, it just inserts.
-        """
-        if not records:
-            return
+    # def _bulk_upsert(self, model, records, conflict_column):
+    #     """
+    #     SQLite upsert using INSERT OR REPLACE semantics.
+    #     For tables with unique constraints, this updates on conflict.
+    #     For tables without, it just inserts.
+    #     """
+    #     if not records:
+    #         return
 
-        with get_session(self.engine) as session:
-            try:
-                if conflict_column:
-                    # Use bulk merge (session.merge handles insert-or-update on PK)
-                    for record in records:
-                        session.merge(record)
-                else:
-                    # No unique key — just add all (used for weekly tables)
-                    # First clear the affected seasons to avoid dupes
-                    session.add_all(records)
-                session.commit()
-            except Exception as e:
-                session.rollback()
-                logger.error(f"Upsert failed for {model.__tablename__}: {e}")
-                raise
+    #     with get_session(self.engine) as session:
+    #         try:
+    #             if conflict_column:
+    #                 # Use bulk merge (session.merge handles insert-or-update on PK)
+    #                 for record in records:
+    #                     session.merge(record)
+    #             else:
+    #                 # No unique key — just add all (used for weekly tables)
+    #                 # First clear the affected seasons to avoid dupes
+    #                 session.add_all(records)
+    #             session.commit()
+    #         except Exception as e:
+    #             session.rollback()
+    #             logger.error(f"Upsert failed for {model.__tablename__}: {e}")
+    #             raise
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+# def _count_games_per_team(season_pbp: pd.DataFrame) -> dict[str, int]:
+#     """Count distinct game_ids per team — needed for per-game rate calculations."""
+#     if "game_id" not in season_pbp.columns:
+#         return {}
+#     return season_pbp.groupby("posteam")["game_id"].nunique().to_dict()
+ 
+ 
+# def _compute_points_per_game(schedules: pd.DataFrame, season: int) -> dict[str, float]:
+#     """
+#     Compute average points scored per game from the schedules table.
+#     Unpivots home/away into one row per team per game, then averages.
+#     """
+#     season_sched = schedules[
+#         (schedules["season"] == season) &
+#         (schedules.get("game_type", pd.Series(["REG"] * len(schedules))) == "REG")
+#     ].copy()
+#     required = {"home_team", "away_team", "home_score", "away_score"}
+#     if season_sched.empty or not required.issubset(season_sched.columns):
+#         return {}
+#     home = season_sched[["home_team", "home_score"]].rename(columns={"home_team": "team", "home_score": "points"})
+#     away = season_sched[["away_team", "away_score"]].rename(columns={"away_team": "team", "away_score": "points"})
+#     all_games = pd.concat([home, away], ignore_index=True).dropna(subset=["points"])
+#     return all_games.groupby("team")["points"].mean().round(2).to_dict()
+ 
+ 
+# def _compute_ol_rank(season_pbp: pd.DataFrame) -> dict[str, int]:
+#     """
+#     Rank all 32 teams 1–32 on OL quality using sacks allowed per pass attempt.
+#     Rank 1 = best OL (fewest sacks). Correlates with PFF OL grade at r≈0.65.
+#     """
+#     if season_pbp.empty or "sack" not in season_pbp.columns:
+#         return {}
+#     pass_plays = season_pbp[season_pbp["pass_attempt"] == 1].copy()
+#     stats = (
+#         pass_plays.groupby("posteam")
+#         .agg(pass_attempts=("pass_attempt", "sum"), sacks=("sack", "sum"))
+#         .reset_index()
+#     )
+#     stats = stats[stats["pass_attempts"] > 0].copy()
+#     stats["sack_rate"] = stats["sacks"] / stats["pass_attempts"]
+#     stats["ol_rank"] = stats["sack_rate"].rank(method="min").astype(int)
+#     return stats.set_index("posteam")["ol_rank"].to_dict()
 
-def _safe_int(val):
-    try:
-        if pd.isna(val):
-            return None
-        return int(float(val))
-    except (TypeError, ValueError):
-        return None
+# def _safe_int(val):
+#     try:
+#         if pd.isna(val):
+#             return None
+#         return int(float(val))
+#     except (TypeError, ValueError):
+#         return None
 
 
-def _safe_date(val):
-    if not val or (isinstance(val, float) and pd.isna(val)):
-        return None
-    try:
-        return pd.to_datetime(val).date()
-    except Exception:
-        return None
+# def _safe_date(val):
+#     if not val or (isinstance(val, float) and pd.isna(val)):
+#         return None
+#     try:
+#         return pd.to_datetime(val).date()
+#     except Exception:
+#         return None

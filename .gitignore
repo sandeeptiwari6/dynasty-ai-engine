@@ -2,6 +2,9 @@ __pycache__/
 build/
 dist/
 notebooks/.ipynb_checkpoints/
+notebooks/mlruns/
 *.egg-info
 *.db
 Pipfile
+Pipfile.lock
+*/.DS_Store

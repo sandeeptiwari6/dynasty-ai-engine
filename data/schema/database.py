@@ -324,6 +324,23 @@ class CollegeSeasonStats(Base):
         UniqueConstraint("cfbd_player_id", "season", name="uix_college_player_season"),
     )
 
+class CollegeGamesPlayed(Base):
+    """
+    Per-game college participation data from CFBD API.
+    Used to calculate missed games and early-career workload.
+    """
+    __tablename__ = "college_games_played"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    cfbd_player_id  = Column(Integer, index=True)
+    season          = Column(Integer)
+    games_played    = Column(Integer)
+
+    # player = relationship("Player", back_populates="college_stats")
+
+    __table_args__ = (
+        UniqueConstraint("cfbd_player_id", "season", name="uix_college_games_player_season"),
+    )
 
 class CombineMeasurements(Base):
     """
@@ -407,7 +424,8 @@ class EngineeredFeatures(Base):
     cpoe                    = Column(Float)             # completion pct over expected (QB)
     ryoe_per_att            = Column(Float)             # rush yards over expected (RB)
     separation_avg          = Column(Float)             # NGS cushion/separation (WR/TE)
-    catch_pct_above_expected = Column(Float)            # NGS receiving CPOE
+    avg_yac_above_expectation = Column(Float)             # NGS yards after catch above expectation (WR/TE)
+    # catch_pct_above_expected = Column(Float)            # NGS receiving CPOE
 
     # ---- Injury features ----
     games_missed_last_season = Column(Integer)

@@ -8,7 +8,7 @@ from models.base import DynastyModel, PredictionResult
 from models.nfl_forecaster import NFLPerformanceForecaster, train_all_forecasters
 from models.injury_risk import InjuryRiskModel
 from models.college_translator import CollegeToNFLTranslator, train_all_translators
-from pipeline import load_features_for_ml, get_feature_columns
+from pipeline import load_features_for_ml
 
 logger = logging.getLogger(__name__)
 
