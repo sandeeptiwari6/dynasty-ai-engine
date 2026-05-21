@@ -29,6 +29,9 @@ def run_full_backfill(
     end_year: Optional[int] = None,
     cfbd_api_key: Optional[str] = None,
     sleeper_league_id: Optional[str] = None,
+    use_cached_data: bool = True,
+    nfl_overwrite: bool = False,
+    college_overwrite: bool = False
 ):
     """
     Complete backfill from start_year to present.
@@ -47,27 +50,27 @@ def run_full_backfill(
     init_db(engine)
 
     # 1. NFL data
-    logger.info("\n[1/5] NFL Player & Stats Ingestion")
-    nfl_pipeline = NFLIngestion(engine)
-    nfl_pipeline.run_full_backfill(start_year=start_year, end_year=end_year)
+    # logger.info("\n[1/5] NFL Player & Stats Ingestion")
+    # nfl_pipeline = NFLIngestion(engine)
+    # nfl_pipeline.run_full_backfill(start_year=start_year, end_year=end_year, overwrite=nfl_overwrite)  # overwrite option for testing/debugging; full backfill is idempotent so safe to re-run with overwrite=True if needed
 
     # 2. College data
-    logger.info("\n[2/5] College Stats & Combine Ingestion")
-    cfbd_key = cfbd_api_key or os.getenv("CFBD_API_KEY")
-    if cfbd_key:
-        college_pipeline = CollegeIngestion(engine, api_key=cfbd_key)
-        college_pipeline.run_full_backfill(start_year=start_year - 5, end_year=end_year)  # pull extra college years for older players' draft context
-    else:
-        logger.warning("  CFBD_API_KEY not set — skipping college stats. "
-                       "Get a free key at https://collegefootballdata.com/key")
+    # logger.info("\n[2/5] College Stats & Combine Ingestion")
+    # cfbd_key = cfbd_api_key or os.getenv("CFBD_API_KEY")
+    # if cfbd_key:
+    #     college_pipeline = CollegeIngestion(engine, api_key=cfbd_key)
+    #     college_pipeline.run_full_backfill(start_year=start_year - 3, end_year=end_year, use_cached_data=use_cached_data, overwrite=college_overwrite)  # pull extra college years for older players' draft context
+    # else:
+    #     logger.warning("  CFBD_API_KEY not set — skipping college stats. "
+    #                    "Get a free key at https://collegefootballdata.com/key")
 
     # 3. Sleeper data
-    logger.info("\n[3/5] Sleeper API Ingestion")
-    sleeper_pipeline = SleeperIngestion(engine)
-    sleeper_pipeline.ingest_players()    # maps sleeper IDs → GSIS IDs
+    # logger.info("\n[3/5] Sleeper API Ingestion")
+    # sleeper_pipeline = SleeperIngestion(engine)
+    # sleeper_pipeline.ingest_players()    # maps sleeper IDs → GSIS IDs
     # sleeper_pipeline.ingest_trending_snapshot()  # today's trending adds/drops
 
-    # 4. Feature engineering
+    # # 4. Feature engineering
     logger.info("\n[4/5] Feature Engineering")
     feature_pipeline = FeatureEngineer(engine)
     feature_pipeline.run(seasons=years)
@@ -77,7 +80,7 @@ def run_full_backfill(
 
     return engine
 
-def run_annual_refresh(year: int, cfbd_api_key: Optional[str] = None):
+def run_annual_refresh(year: int, cfbd_api_key: Optional[str] = None, use_cached_data: bool = True):
     """
     Pull just the latest year of data and recompute features.
     Run this at the start of each NFL season (late August/September).
@@ -91,7 +94,8 @@ def run_annual_refresh(year: int, cfbd_api_key: Optional[str] = None):
     cfbd_key = cfbd_api_key or os.getenv("CFBD_API_KEY")
     if cfbd_key:
         CollegeIngestion(engine, api_key=cfbd_key).run_full_backfill(
-            start_year=year - 1, end_year=year - 1  # last college season
+            start_year=year - 1, end_year=year - 1, # last college season
+            use_cached_data=use_cached_data 
         )
 
     SleeperIngestion(engine).ingest_trending_snapshot()
@@ -132,7 +136,10 @@ def load_features_for_ml(
     engine = get_engine()
 
     query = """
-        SELECT ef.*, p.name as player_name, p.nfl_team, p.sleeper_id
+        SELECT ef.*, 
+               p.name as player_name, 
+               p.nfl_team, p.sleeper_id,
+               p.draft_year
         FROM engineered_features ef
         JOIN players p ON ef.player_id = p.player_id
         WHERE ef.season BETWEEN :min_season AND :max_season
@@ -177,7 +184,8 @@ def get_feature_columns(position: Optional[str] = None) -> dict[str, list[str]]:
     efficiency = [
         "yards_per_target", "yards_per_carry", "yards_after_catch_per_rec",
         "racr", "epa_per_play", "cpoe", "ryoe_per_att",
-        "separation_avg", "catch_pct_above_expected",
+        "separation_avg", 
+        "avg_yac_above_expectation",
     ]
     injury = [
         "games_missed_last_season", "games_missed_2yr_total", "injury_risk_score",
@@ -205,7 +213,7 @@ def get_feature_columns(position: Optional[str] = None) -> dict[str, list[str]]:
         base_features = [
             f for f in base_features
             if f not in ("target_share", "air_yards_share", "wopr", "targets_per_game",
-                         "yards_per_target", "racr", "separation_avg", "catch_pct_above_expected")
+                         "yards_per_target", "racr", "separation_avg", "avg_yac_above_expectation")
         ]
     elif position == "RB":
         # RBs receiving role matters less; rushing efficiency more
@@ -278,6 +286,9 @@ if __name__ == "__main__":
     parser.add_argument("--year", type=int, help="Year for annual refresh")
     parser.add_argument("--cfbd-key", type=str, help="College Football Data API key")
     parser.add_argument("--league-id", type=str, help="Sleeper league ID")
+    parser.add_argument("--use-cached-data", action="store_true", help="Use cached data where available")
+    parser.add_argument("--nfl-overwrite", action="store_true", help="Use cached data where available")
+    parser.add_argument("--college-overwrite", action="store_true", help="Use cached data where available")
     args = parser.parse_args()
 
     if args.backfill:
@@ -286,10 +297,17 @@ if __name__ == "__main__":
             end_year=args.end_year,
             cfbd_api_key=args.cfbd_key,
             sleeper_league_id=args.league_id,
+            use_cached_data=args.use_cached_data,
+            nfl_overwrite=args.nfl_overwrite,
+            college_overwrite=args.college_overwrite
         )
     elif args.refresh:
         import datetime
         year = args.year or datetime.datetime.now().year
-        run_annual_refresh(year=year, cfbd_api_key=args.cfbd_key)
+        run_annual_refresh(
+            year=year, 
+            cfbd_api_key=args.cfbd_key, 
+            use_cached_data=args.use_cached_data
+        )
     else:
         parser.print_help()

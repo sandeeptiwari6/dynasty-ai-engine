@@ -7,6 +7,11 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import text
 
+from utils.constants import NORMALIZED_COLLEGE_TEAMS
+from utils.helpers import (
+    make_player_key, _calc_yards_per_game, _calc_tds_per_game, _compute_scheme_fit, _classify_conference,
+    _normalize_draft_pick, _age_on_date, rolling_diff, _i, _f
+)
 from data.schema.database import EngineeredFeatures, get_session
 
 
@@ -52,8 +57,11 @@ class FeatureEngineer:
         college_df = self._load_college_stats()
         combine_df = self._load_combine_data()
 
+        EngineeredFeatures.__table__.drop(self.engine, checkfirst=True)
+        EngineeredFeatures.metadata.create_all(self.engine)
+
         # Merge everything onto the stats base
-        df = self._merge_all(stats_df, adv_df, injury_df, snap_df, players_df, team_df)
+        df = self._merge_all(stats_df, snap_df, team_df)
 
         # Compute feature groups
         df = self._add_performance_trajectory(df)
@@ -138,7 +146,7 @@ class FeatureEngineer:
     # Merging
     # ------------------------------------------------------------------
 
-    def _merge_all(self, stats_df, adv_df, injury_df, snap_df, players_df, team_df) -> pd.DataFrame:
+    def _merge_all(self, stats_df, snap_df, team_df) -> pd.DataFrame:
         """Merge all data sources onto the seasonal stats base."""
         df = stats_df.copy()
 
@@ -309,6 +317,13 @@ class FeatureEngineer:
             .reset_index(name="games_missed")
         )
 
+        injury_count_df = (
+            injury_df[injury_df['report_status'].isin(['Out', 'Doubtful', 'Questionable'])]
+            .groupby(["player_id", "season"])
+            .size()
+            .reset_index(name="injury_designation_count")
+        )
+
         # Weighted injury designation count (Out=1.0, Questionable=0.3, etc.)
         injury_df["designation_weight"] = injury_df["report_status"].map(
             self.DESIGNATION_WEIGHT
@@ -357,6 +372,7 @@ class FeatureEngineer:
         # Merge all injury features into main df
         df = df.merge(games_missed.rename(columns={"games_missed": "games_missed_last_season"}),
                       on=["player_id", "season"], how="left")
+        df = df.merge(injury_count_df, on=["player_id", "season"], how="left").fillna({"injury_designation_count": 0})
         df = df.merge(games_missed_2yr[["player_id", "season", "games_missed_2yr"]].rename(
                       columns={"games_missed_2yr": "games_missed_2yr_total"}),
                       on=["player_id", "season"], how="left")
@@ -522,48 +538,53 @@ class FeatureEngineer:
         college_df["adjusted_dominator"] = college_df["dominator_rating"] * college_df["adj_multiplier"]
 
         # ---- Per-game production ----
-        college_df["college_yards_per_game"] = (
-            college_df["rec_yards"] / college_df["games_played"].replace(0, np.nan)
-        )
-        college_df["college_tds_per_game"] = (
-            college_df["rec_tds"] / college_df["games_played"].replace(0, np.nan)
-        )
+        college_df["college_yards_per_game"] = college_df.apply(_calc_yards_per_game, axis=1)
+        college_df["college_tds_per_game"] = college_df.apply(_calc_tds_per_game, axis=1)
 
         # ---- Breakout Age ----
         # Earliest season a player hit 20%+ dominator rating
         # Requires knowing player age at that season — join with player birth dates
-        players_slim = players_df[["player_id", "birth_date", "cfbd_id"]].copy()
+        players_slim = (
+            players_df[["player_id", "name", "college_team", "position", "birth_date"]]
+            .copy()
+            .rename(columns={"college_team": "team", "name":"player_name"})
+            .groupby(["player_name", "position", "team"]).first().reset_index()
+        )
         players_slim["birth_date"] = pd.to_datetime(players_slim["birth_date"], errors="coerce")
+        players_slim['team'] = players_slim['team'].str.split('; ')
+        players_slim = players_slim.explode("team")
+        players_slim["team"] = players_slim["team"].apply(lambda x: NORMALIZED_COLLEGE_TEAMS.get(x, x))
+        players_slim["norm_player_key"] = players_slim["player_name"].apply(make_player_key) + "_" + players_slim["position"].str.lower() + "_" + players_slim["team"].apply(make_player_key)
+        players_slim = players_slim.sort_values("player_id", ascending=True).groupby("norm_player_key").first().reset_index()
 
         # Normalize cfbd id dtypes to avoid int64 vs object merge errors
-        players_slim = players_slim.rename(columns={"cfbd_id": "cfbd_player_id"})
-        players_slim["cfbd_player_id"] = players_slim["cfbd_player_id"].astype("string")
         if "cfbd_player_id" in college_df.columns:
             college_df["cfbd_player_id"] = college_df["cfbd_player_id"].astype("string")
         else:
             college_df["cfbd_player_id"] = pd.Series(dtype="string")
 
-        college_with_player = college_df.merge(players_slim, on="cfbd_player_id", how="left")
+        college_df["norm_player_key"] = college_df["player_name"].apply(make_player_key) + "_" + college_df["position"].str.lower() + "_" + college_df["team"].apply(make_player_key)
+        college_with_player = college_df.drop("player_id", axis=1).merge(players_slim[["norm_player_key", "player_id", "birth_date"]], on=["norm_player_key"], how="inner")
         college_with_player["age_at_season"] = college_with_player.apply(
             lambda r: _age_on_date(r["birth_date"], date(int(r["season"]), 9, 1))
             if pd.notna(r.get("birth_date")) else np.nan,
             axis=1,
         )
-
         breakout = (
             college_with_player[college_with_player["dominator_rating"] >= 0.20]
-            .groupby("cfbd_player_id")["age_at_season"]
+            .groupby("player_id")["age_at_season"]
             .min()
             .reset_index(name="breakout_age")
         )
 
         # Best college season (highest adjusted dominator)
         best_college_season = (
-            college_df.sort_values("adjusted_dominator", ascending=False)
-            .groupby("cfbd_player_id")
+            college_with_player
+            .sort_values("adjusted_dominator", ascending=False)
+            .groupby("player_id")
             .first()
             .reset_index()
-            [["cfbd_player_id", "adjusted_dominator", "college_yards_per_game",
+            [["player_id", "cfbd_player_id", "adjusted_dominator", "college_yards_per_game",
               "college_tds_per_game", "conference_tier"]]
             .rename(columns={
                 "adjusted_dominator": "dominator_rating",
@@ -573,7 +594,7 @@ class FeatureEngineer:
 
         # ---- Combine / athleticism ----
         combine_slim = combine_df[[
-            "player_id", "sparq_score", "relative_athletic_score",
+            "player_id", "draft_year", "sparq_score", "relative_athletic_score",
             "speed_score", "forty_yard", "vertical_jump", "bmi"
         ]].copy()
 
@@ -581,20 +602,11 @@ class FeatureEngineer:
         # rookies are identified by years_exp == 0 or 1
         df["is_rookie_or_sophomore"] = df["years_exp"].isin([0, 1])
 
-        # Map cfbd_player_id → player_id via players table
-        cfbd_to_gsis = (
-            players_slim[players_slim["cfbd_player_id"].notna()]
-            .rename(columns={"cfbd_id": "cfbd_player_id"})
-            [["player_id", "cfbd_player_id"]]
-            .drop_duplicates()
-        )
-        best_college_season = best_college_season.merge(cfbd_to_gsis, on="cfbd_player_id", how="left")
-        best_college_season = best_college_season.merge(breakout, on="cfbd_player_id", how="left")
-        best_college_season = best_college_season.merge(combine_slim, on="player_id", how="left")
-
+        best_college_season = best_college_season.merge(breakout, on="player_id", how="left")
+        best_college_season = best_college_season.merge(combine_slim, on="player_id", how="left")    
         df = df.merge(
             best_college_season[[
-                "player_id", "dominator_rating", "college_yards_per_game",
+                "player_id", "draft_year", "dominator_rating", "college_yards_per_game",
                 "college_tds_per_game", "college_conference_tier", "breakout_age",
                 "sparq_score", "relative_athletic_score", "speed_score",
                 "forty_yard", "vertical_jump", "bmi"
@@ -648,7 +660,8 @@ class FeatureEngineer:
                 cpoe=_f(row.get("cpoe")),
                 ryoe_per_att=_f(row.get("ryoe_per_att")),
                 separation_avg=_f(row.get("avg_separation")),
-                catch_pct_above_expected=_f(row.get("catch_pct_above_expectation")),
+                avg_yac_above_expectation=_f(row.get("avg_yac_above_expectation")),
+                # catch_pct_above_expected=_f(row.get("catch_pct_above_expectation")),
                 # Injury
                 games_missed_last_season=_i(row.get("games_missed_last_season")),
                 games_missed_2yr_total=_i(row.get("games_missed_2yr_total")),
@@ -656,6 +669,7 @@ class FeatureEngineer:
                 soft_tissue_injury_flag=bool(row.get("soft_tissue_injury_flag", False)),
                 acl_history_flag=bool(row.get("acl_history_flag", False)),
                 concussion_history_count=_i(row.get("concussion_history_count")),
+                injury_designation_count=_i(row.get("injury_designation_count")),
                 # Age
                 age=_f(row.get("age")),
                 age_at_nfl_entry=_f(row.get("age_at_nfl_entry")),
@@ -682,6 +696,7 @@ class FeatureEngineer:
                 sparq_score=_f(row.get("sparq_score")),
                 relative_athletic_score=_f(row.get("relative_athletic_score")),
                 speed_score=_f(row.get("speed_score")),
+                height_weight_bmi=_f(row.get("bmi")),
                 forty_yard=_f(row.get("forty_yard")),
                 vertical_jump=_f(row.get("vertical_jump")),
                 # Target
@@ -693,77 +708,3 @@ class FeatureEngineer:
             for r in records:
                 session.merge(r)
             session.commit()
-
-
-# ------------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------------
-
-def _compute_scheme_fit(row) -> float:
-    """
-    Scheme fit: 0-1 score of how well player role matches team offensive system.
-    High target share players fit best on high pass-rate teams.
-    High carry players fit best on run-heavy teams.
-    """
-    pass_rate = row.get("pass_rate") or 0.5
-    target_share = row.get("target_share") or 0
-    carries_pg = row.get("carries_per_game") or 0
-    position = row.get("position", "")
-
-    if position in ("WR", "TE"):
-        # WR/TE thrive on high pass-rate teams
-        return min(1.0, target_share * 5 * pass_rate)
-    elif position == "RB":
-        # RBs thrive on run-heavy teams (1-pass_rate = run rate)
-        run_rate = 1 - pass_rate
-        return min(1.0, (carries_pg / 15) * (run_rate * 2))
-    return 0.5
-
-
-def _classify_conference(conference: Optional[str]) -> int:
-    """Return conference tier (1=P5, 2=G5, 3=FCS/other)."""
-    if not conference:
-        return 2
-    p5 = {"SEC", "Big Ten", "Big 12", "ACC", "Pac-12", "Pac-10"}
-    g5 = {"American Athletic", "Mountain West", "Conference USA", "MAC", "Sun Belt"}
-    if conference in p5:
-        return 1
-    elif conference in g5:
-        return 2
-    return 3
-
-
-def _normalize_draft_pick(pick: float) -> float:
-    if not pick or pick <= 0:
-        return 0.0
-    return max(0.0, 1.0 - (math.log(float(pick)) / math.log(300)))
-
-
-def _age_on_date(birth_date, as_of: date) -> Optional[float]:
-    if pd.isna(birth_date):
-        return None
-    bd = birth_date.date() if hasattr(birth_date, "date") else birth_date
-    return (as_of - bd).days / 365.25
-
-
-def rolling_diff(series: pd.Series) -> pd.Series:
-    """Year-over-year change in a metric."""
-    return series.diff()
-
-
-def _f(val) -> Optional[float]:
-    try:
-        if pd.isna(val):
-            return None
-        return float(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def _i(val) -> Optional[int]:
-    try:
-        if pd.isna(val):
-            return None
-        return int(float(val))
-    except (TypeError, ValueError):
-        return None

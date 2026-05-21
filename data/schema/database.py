@@ -120,7 +120,7 @@ class NFLSeasonStats(Base):
     season_type     = Column(String, default="REG")     # REG, POST
     team            = Column(String)
     games           = Column(Integer)
-    games_started   = Column(Integer)
+    # games_started   = Column(Integer)
 
     # Passing
     completions     = Column(Integer)
@@ -240,6 +240,7 @@ class NFLWeeklySnaps(Base):
     offense_snaps   = Column(Integer)
     offense_pct     = Column(Float)
     defense_snaps   = Column(Integer)
+    defense_pct     = Column(Float)
     st_snaps        = Column(Integer)
 
     __table_args__ = (
@@ -317,17 +318,29 @@ class CollegeSeasonStats(Base):
     team_rec_yards  = Column(Integer)
     team_rec_tds    = Column(Integer)
 
-    # Dominator ratings (player's share of team production)
-    dominatory_yards = Column(Float)
-    dominator_tds    = Column(Float)
-    dominator_score  = Column(Float)
-
     player = relationship("Player", back_populates="college_stats")
 
     __table_args__ = (
         UniqueConstraint("cfbd_player_id", "season", name="uix_college_player_season"),
     )
 
+class CollegeGamesPlayed(Base):
+    """
+    Per-game college participation data from CFBD API.
+    Used to calculate missed games and early-career workload.
+    """
+    __tablename__ = "college_games_played"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    cfbd_player_id  = Column(Integer, index=True)
+    season          = Column(Integer)
+    games_played    = Column(Integer)
+
+    # player = relationship("Player", back_populates="college_stats")
+
+    __table_args__ = (
+        UniqueConstraint("cfbd_player_id", "season", name="uix_college_games_player_season"),
+    )
 
 class CombineMeasurements(Base):
     """
@@ -411,7 +424,8 @@ class EngineeredFeatures(Base):
     cpoe                    = Column(Float)             # completion pct over expected (QB)
     ryoe_per_att            = Column(Float)             # rush yards over expected (RB)
     separation_avg          = Column(Float)             # NGS cushion/separation (WR/TE)
-    catch_pct_above_expected = Column(Float)            # NGS receiving CPOE
+    avg_yac_above_expectation = Column(Float)             # NGS yards after catch above expectation (WR/TE)
+    # catch_pct_above_expected = Column(Float)            # NGS receiving CPOE
 
     # ---- Injury features ----
     games_missed_last_season = Column(Integer)
