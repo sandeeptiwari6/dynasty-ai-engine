@@ -594,7 +594,7 @@ class FeatureEngineer:
 
         # ---- Combine / athleticism ----
         combine_slim = combine_df[[
-            "player_id", "sparq_score", "relative_athletic_score",
+            "player_id", "draft_year", "sparq_score", "relative_athletic_score",
             "speed_score", "forty_yard", "vertical_jump", "bmi"
         ]].copy()
 
@@ -606,7 +606,7 @@ class FeatureEngineer:
         best_college_season = best_college_season.merge(combine_slim, on="player_id", how="left")    
         df = df.merge(
             best_college_season[[
-                "player_id", "dominator_rating", "college_yards_per_game",
+                "player_id", "draft_year", "dominator_rating", "college_yards_per_game",
                 "college_tds_per_game", "college_conference_tier", "breakout_age",
                 "sparq_score", "relative_athletic_score", "speed_score",
                 "forty_yard", "vertical_jump", "bmi"

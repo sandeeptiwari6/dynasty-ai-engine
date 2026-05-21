@@ -136,7 +136,10 @@ def load_features_for_ml(
     engine = get_engine()
 
     query = """
-        SELECT ef.*, p.name as player_name, p.nfl_team, p.sleeper_id
+        SELECT ef.*, 
+               p.name as player_name, 
+               p.nfl_team, p.sleeper_id,
+               p.draft_year
         FROM engineered_features ef
         JOIN players p ON ef.player_id = p.player_id
         WHERE ef.season BETWEEN :min_season AND :max_season

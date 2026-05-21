@@ -126,7 +126,7 @@ class NFLPerformanceForecaster(DynastyModel):
             logger.debug(f"  [{self.position}] Fold {fold+1} MAE: {fold_mae:.2f}")
 
         cv_mae = float(np.mean(cv_maes)) if cv_maes else float("nan")
-        logger.info(f"[{self.position}] TimeSeriesCV MAE: {cv_mae:.2f} PPG ({len(tscv.split(X))} folds)")
+        logger.info(f"[{self.position}] TimeSeriesCV MAE: {cv_mae:.2f} PPG ({fold+1} folds)")
 
         # ---- Train final p50 model on all data ----
         self._model_p50 = lgb.LGBMRegressor(**LGBM_BASE_PARAMS)
