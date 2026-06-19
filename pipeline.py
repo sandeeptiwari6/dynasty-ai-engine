@@ -50,25 +50,25 @@ def run_full_backfill(
     init_db(engine)
 
     # 1. NFL data
-    # logger.info("\n[1/5] NFL Player & Stats Ingestion")
-    # nfl_pipeline = NFLIngestion(engine)
-    # nfl_pipeline.run_full_backfill(start_year=start_year, end_year=end_year, overwrite=nfl_overwrite)  # overwrite option for testing/debugging; full backfill is idempotent so safe to re-run with overwrite=True if needed
+    logger.info("\n[1/5] NFL Player & Stats Ingestion")
+    nfl_pipeline = NFLIngestion(engine)
+    nfl_pipeline.run_full_backfill(start_year=start_year, end_year=end_year, overwrite=nfl_overwrite)  # overwrite option for testing/debugging; full backfill is idempotent so safe to re-run with overwrite=True if needed
 
     # 2. College data
-    # logger.info("\n[2/5] College Stats & Combine Ingestion")
-    # cfbd_key = cfbd_api_key or os.getenv("CFBD_API_KEY")
-    # if cfbd_key:
-    #     college_pipeline = CollegeIngestion(engine, api_key=cfbd_key)
-    #     college_pipeline.run_full_backfill(start_year=start_year - 3, end_year=end_year, use_cached_data=use_cached_data, overwrite=college_overwrite)  # pull extra college years for older players' draft context
-    # else:
-    #     logger.warning("  CFBD_API_KEY not set — skipping college stats. "
-    #                    "Get a free key at https://collegefootballdata.com/key")
+    logger.info("\n[2/5] College Stats & Combine Ingestion")
+    cfbd_key = cfbd_api_key or os.getenv("CFBD_API_KEY")
+    if cfbd_key:
+        college_pipeline = CollegeIngestion(engine, api_key=cfbd_key)
+        college_pipeline.run_full_backfill(start_year=start_year - 3, end_year=end_year, use_cached_data=use_cached_data, overwrite=college_overwrite)  # pull extra college years for older players' draft context
+    else:
+        logger.warning("  CFBD_API_KEY not set — skipping college stats. "
+                       "Get a free key at https://collegefootballdata.com/key")
 
     # 3. Sleeper data
-    # logger.info("\n[3/5] Sleeper API Ingestion")
-    # sleeper_pipeline = SleeperIngestion(engine)
-    # sleeper_pipeline.ingest_players()    # maps sleeper IDs → GSIS IDs
-    # sleeper_pipeline.ingest_trending_snapshot()  # today's trending adds/drops
+    logger.info("\n[3/5] Sleeper API Ingestion")
+    sleeper_pipeline = SleeperIngestion(engine)
+    sleeper_pipeline.ingest_players()    # maps sleeper IDs → GSIS IDs
+    sleeper_pipeline.ingest_trending_snapshot()  # today's trending adds/drops
 
     # # 4. Feature engineering
     logger.info("\n[4/5] Feature Engineering")

@@ -1,4 +1,7 @@
+import hashlib
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 import logging
 
 from sqlalchemy import (
@@ -12,18 +15,6 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent.parent.parent / "dynasty_scout.db"
 
-
-def get_engine(db_path: Path = DB_PATH, echo: bool = False):
-    """
-    Returns a SQLAlchemy engine. Uses StaticPool so the same connection
-    is reused in single-threaded contexts (fine for local use).
-    """
-    return create_engine(
-        f"sqlite:///{db_path}",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        echo=echo,
-    )
 
 class Base(DeclarativeBase):
     pass
@@ -43,6 +34,7 @@ class Player(Base):
     player_id       = Column(String, primary_key=True)   # e.g. "00-0036355" (GSIS) or sleeper id
     sleeper_id      = Column(String, index=True)
     gsis_id         = Column(String, index=True)          # NFL play-by-play system id
+    pfr_id          = Column(String, index=True)          # Pro Football Reference id (e.g. "BradyTo00")
     cfbd_id         = Column(Integer)                     # College Football Data API id
     name            = Column(String, nullable=False, index=True)
     first_name      = Column(String)
@@ -504,12 +496,117 @@ class SleeperLeagueSnapshot(Base):
     percent_owned   = Column(Float)
     percent_started = Column(Float)
 
+# ---------------------------------------------------------------------------
+# Source type constants — used in metadata filtering during retrieval
+# ---------------------------------------------------------------------------
+class SourceType:
+    NFL_COM_BIO      = "nfl_com_bio"          # NFL.com player bio pages
+    PFF_GRADE        = "pff_grade"            # PFF free-tier grade summaries
+    BEAT_REPORTER    = "beat_reporter"        # Local beat reporter articles
+    DRAFT_PROFILE    = "draft_profile"        # Draft prospect profiles (ESPN, NFL.com)
+    INJURY_REPORT    = "injury_report"        # Official injury report text
+    DEPTH_CHART      = "depth_chart"          # Depth chart notes
+    COLLEGE_PROFILE  = "college_profile"      # College stats narrative pages
+    SLEEPER_NOTE     = "sleeper_note"         # Sleeper news/notes feed
+    TRANSACTION_NOTE = "transaction_note"     # FA signings, trades, cuts
+    GAME_RECAP       = "game_recap"           # Post-game box score recaps
+
+
+# ---------------------------------------------------------------------------
+# RAG document tables
+# ---------------------------------------------------------------------------
+
+class ScoutingDocument(Base):
+    """
+    Raw text of every document ingested into the RAG pipeline.
+    One row per source URL / document.
+
+    This is the single source of truth for:
+      - Deduplication (don't re-scrape same URL within TTL window)
+      - Staleness detection (content_hash changes → re-embed)
+      - Traceability (every Chroma chunk links back to a doc_id here)
+      - Rollback (can re-chunk/re-embed from stored raw_text without re-scraping)
+    """
+    __tablename__ = "scouting_documents"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Source identification
+    url             = Column(String, nullable=False)      # canonical URL
+    source_type     = Column(String, nullable=False)      # SourceType constant
+    player_id       = Column(String, index=True)          # FK to players.player_id (nullable for team docs)
+    player_name     = Column(String, index=True)          # denormalized for fast filtering
+    season          = Column(Integer, index=True)         # NFL season year this doc relates to
+    team            = Column(String)                      # team abbreviation if relevant
+
+    # Content
+    title           = Column(String)
+    raw_text        = Column(Text, nullable=False)        # full scraped text, pre-chunking
+    content_hash    = Column(String(64), nullable=False)  # SHA-256 of raw_text for dedup
+
+    # Ingestion state
+    scraped_at      = Column(DateTime, default=datetime.now())
+    embedded_at     = Column(DateTime)                    # null = not yet in Chroma
+    is_embedded     = Column(Boolean, default=False)
+    chunk_count     = Column(Integer)                     # how many chunks in Chroma
+    embedding_model = Column(String)                      # model used (for re-embed on model change)
+
+    # Quality signals
+    char_count      = Column(Integer)
+    is_usable       = Column(Boolean, default=True)       # False = too short / encoding error / paywall
+
+    __table_args__ = (
+        UniqueConstraint("url", name="uix_scouting_url"),
+        Index("ix_scouting_player_season", "player_id", "season"),
+        Index("ix_scouting_source_type", "source_type"),
+    )
+
+    @staticmethod
+    def compute_hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class RagIngestionLog(Base):
+    """
+    Audit log of every RAG indexing run.
+    One row per pipeline execution — useful for debugging and incremental runs.
+    """
+    __tablename__ = "rag_ingestion_log"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    run_at          = Column(DateTime, default=datetime.now())
+    trigger         = Column(String)                      # "manual", "scheduled", "new_player"
+    docs_scraped    = Column(Integer, default=0)
+    docs_skipped    = Column(Integer, default=0)          # already current (hash match)
+    docs_embedded   = Column(Integer, default=0)
+    chunks_added    = Column(Integer, default=0)
+    chunks_deleted  = Column(Integer, default=0)          # old chunks replaced
+    embedding_model = Column(String)
+    duration_seconds= Column(Float)
+    errors          = Column(Text)                        # JSON list of error messages
+
+
+
+############################################################
+##################### DATABASE UTILITIES ###################
+############################################################
+
+def get_engine(db_path: Path = DB_PATH, echo: bool = False):
+    """
+    Returns a SQLAlchemy engine. Uses StaticPool so the same connection
+    is reused in single-threaded contexts (fine for local use).
+    """
+    return create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=echo,
+    )
 
 def init_db(engine) -> None:
     """Create all tables if they don't exist."""
     Base.metadata.create_all(engine)
     logger.info(f"Database initialized at {engine.url}")
-
 
 def get_session(engine) -> Session:
     return Session(engine)

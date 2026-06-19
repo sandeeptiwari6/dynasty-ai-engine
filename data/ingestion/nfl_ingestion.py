@@ -112,6 +112,7 @@ class NFLIngestion:
             player = Player(
                 player_id=str(row.get("player_id") or row.get("gsis_id", "")),
                 gsis_id=str(row.get("gsis_id", "")),
+                pfr_id = str(row.get("pfr_id", "")) if pd.notna(row.get("pfr_id")) else None,
                 sleeper_id=str(row.get("sleeper_id", "")) if pd.notna(row.get("sleeper_id")) else None,
                 name=NORMALIZED_PLAYER_NAMES.get(player_name) or player_name,
                 first_name=row.get("first_name"),
