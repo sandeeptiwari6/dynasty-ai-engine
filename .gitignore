@@ -8,3 +8,5 @@ notebooks/mlruns/
 Pipfile.lock
 */.DS_Store
 .DS_Store
+chroma_db/*
+CLAUDE.md

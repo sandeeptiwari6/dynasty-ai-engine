@@ -187,26 +187,50 @@ class RAGIngestionPipeline:
             self._run_stats["errors"].append(msg)
 
     def _execute_manifest_item(self, item: dict) -> Optional[RawDocument]:
-        """Dispatch a manifest item to the correct scraper function."""
+        """
+        Dispatch a manifest item to the correct scraper and store all resulting docs.
+
+        Most scrapers return a single RawDocument; scrape_sleeper_news returns a list
+        (Sleeper status + multiple ESPN news/rotowire items).  Multi-doc scrapers are
+        stored inline here so nothing is lost.
+        """
         t = item["type"]
         try:
             if t == "nfl_bio":
                 return scrape_nfl_player_bio(item["player_name"], item["nfl_slug"])
+
             elif t == "sleeper_news":
-                # Returns multiple docs; we return None here and handle separately
+                # Returns a list: Sleeper status doc + ESPN news/rotowire docs
                 docs = scrape_sleeper_news(item["sleeper_id"], item["player_name"])
-                # Store all inline since there are multiple
-                return docs[0] if docs else None
-            elif t == "pfr_game_log":
-                return scrape_pfr_game_log(item["player_name"], item["pfr_id"], item["season"])
+                if not docs:
+                    return None
+                # Store all docs except the first inline; return the first as usual
+                with get_session(self.engine) as session:
+                    for doc in docs[1:]:
+                        if doc.is_usable:
+                            self._store_and_embed_raw_doc(session, doc)
+                            self._run_stats["docs_scraped"] += 1
+                return docs[0]
+
+            elif t == "game_log":
+                # Primary: nfl_data_py (via gsis_id=player_id); fallback: PFR/Playwright
+                return scrape_pfr_game_log(
+                    item["player_name"],
+                    item.get("pfr_id", ""),
+                    item["season"],
+                    gsis_id=item.get("player_id", ""),
+                )
+
             elif t == "espn_draft_profile":
                 return scrape_espn_draft_profile(item["player_name"], item["espn_id"])
+
             else:
                 logger.warning(f"Unknown manifest item type: {t}")
                 return None
+
         except Exception as e:
             self._run_stats["errors"].append(f"{t} for {item.get('player_name')}: {e}")
-            print(e)
+            logger.error(f"Manifest item error — {t} for {item.get('player_name')}: {e}")
             return None
 
     def _store_and_embed_raw_doc(

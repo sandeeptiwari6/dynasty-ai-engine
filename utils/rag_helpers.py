@@ -88,9 +88,11 @@ def build_player_url_manifest(
     Build the full list of URLs to scrape for a single player.
     Returns a list of dicts that ScrapeOrchestrator iterates over.
 
-    This is the manifest system — rather than hard-coding scrape targets
-    in each function, we declaratively define what to scrape per player
-    and let the orchestrator handle it. Easy to extend with new sources.
+    Sources:
+      - nfl_bio: NFL.com player page (bio, physical info, roster status)
+      - sleeper_news: Sleeper status + ESPN rotowire/news (Sleeper /news deprecated)
+      - game_log: nfl_data_py weekly stats per season (PFR is Cloudflare-blocked)
+      - espn_draft_profile: ESPN JSON API (only when espn_id is provided)
     """
     season_list = seasons or [2024, 2023, 2022]
     manifest = []
@@ -111,15 +113,17 @@ def build_player_url_manifest(
             "sleeper_id": sleeper_id,
         })
 
-    # if pfr_id:
-    #     for season in season_list:
-    #         manifest.append({
-    #             "type": "pfr_game_log",
-    #             "player_name": player_name,
-    #             "player_id": player_id,
-    #             "pfr_id": pfr_id,
-    #             "season": season,
-    #         })
+    # Game logs via nfl_data_py (primary) with PFR/Playwright as fallback.
+    # pfr_id is passed for the Playwright fallback path; gsis_id (=player_id)
+    # is the preferred key for nfl_data_py lookup.
+    for season in season_list:
+        manifest.append({
+            "type": "game_log",
+            "player_name": player_name,
+            "player_id": player_id,   # GSIS ID — used by nfl_data_py
+            "pfr_id": pfr_id or "",
+            "season": season,
+        })
 
     if espn_id:
         manifest.append({
