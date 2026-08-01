@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/sandeeptiwari/Desktop/dynasty-ai-engine/mlruns/523833904678849822/8f2e548e1ed84ff2b4ec2336991ebbf0/artifacts
+end_time: 1783179271331
+entry_point_name: ''
+experiment_id: '523833904678849822'
+lifecycle_stage: active
+run_id: 8f2e548e1ed84ff2b4ec2336991ebbf0
+run_name: nfl_forecaster_te
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783179264602
+status: 3
+tags: []
+user_id: sandeeptiwari

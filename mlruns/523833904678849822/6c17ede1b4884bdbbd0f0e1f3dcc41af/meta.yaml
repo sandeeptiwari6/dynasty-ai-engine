@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/sandeeptiwari/Desktop/dynasty-ai-engine/mlruns/523833904678849822/6c17ede1b4884bdbbd0f0e1f3dcc41af/artifacts
+end_time: 1783179299794
+entry_point_name: ''
+experiment_id: '523833904678849822'
+lifecycle_stage: active
+run_id: 6c17ede1b4884bdbbd0f0e1f3dcc41af
+run_name: college_translator_wr
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1783179299645
+status: 3
+tags: []
+user_id: sandeeptiwari
