@@ -91,7 +91,7 @@ def retrieve_injury_context(player_name: str, seasons: str = "") -> str:
     results = store.retrieve(
         query=query,
         player_id=player_id or None,
-        player_name=player_name if not player_id else None,
+        player_name=player_name,
         source_types=injury_sources,
         k=6,
     )
@@ -136,7 +136,7 @@ def retrieve_news_context(player_name: str) -> str:
     results = store.retrieve(
         query=f"{player_name} recent news transaction depth chart injury",
         player_id=player_id or None,
-        player_name=player_name if not player_id else None,
+        player_name=player_name,
         source_types=news_sources,
         k=5,
     )
@@ -175,7 +175,7 @@ def retrieve_college_scouting(player_name: str) -> str:
     results = store.retrieve(
         query=f"{player_name} draft prospect college scouting report strengths weaknesses",
         player_id=player_id or None,
-        player_name=player_name if not player_id else None,
+        player_name=player_name,
         source_types=prospect_sources,
         k=6,
     )

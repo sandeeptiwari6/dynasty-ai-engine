@@ -199,6 +199,27 @@ class ScoutingVectorStore:
             List of dicts with keys: text, player_name, source_type, season,
             url, doc_id, relevance_score, chunk_index
         """
+        output = self._query_chunks(query, player_id, player_name, season, source_types, k)
+
+        # Fallback: chunks ingested before player_id backfill carry an empty
+        # player_id and are keyed only by player_name, so an id-scoped filter
+        # can return nothing even when data exists. Retry with a name filter
+        # before giving up (and before any caller triggers an on-demand scrape).
+        if not output and player_id and player_name:
+            output = self._query_chunks(query, None, player_name, season, source_types, k)
+
+        return output
+
+    def _query_chunks(
+        self,
+        query: str,
+        player_id: Optional[str],
+        player_name: Optional[str],
+        season: Optional[int],
+        source_types: Optional[list[str]],
+        k: int,
+    ) -> list[dict]:
+        """Run a single filtered ANN query and normalise the result rows."""
         where = self._build_where_filter(player_id, player_name, season, source_types)
 
         try:
@@ -259,7 +280,9 @@ class ScoutingVectorStore:
             # No query — fetch broadly with a player-description query
             query = f"{player_name} NFL fantasy football scouting report performance"
 
-        chunks = self.retrieve(player_id=player_id, query=query, k=k)
+        # Pass player_name too so retrieve() can fall back to a name filter when
+        # the id filter misses (chunks may have been indexed without a player_id).
+        chunks = self.retrieve(player_id=player_id, player_name=player_name, query=query, k=k)
 
         if not chunks:
             return f"No scouting context available for {player_name}."

@@ -103,6 +103,57 @@ def route_query(state: DynastyState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Sub-agent hand-off helpers
+# ---------------------------------------------------------------------------
+
+def _extract_tool_evidence(messages: list) -> str:
+    """
+    Pull the raw tool outputs out of a react-agent message trace and render them
+    as plain text.
+
+    The report writer is instructed to ground itself ONLY in tool outputs, so it
+    needs to actually SEE them. We render them as text (rather than forwarding the
+    structured tool_use/tool_result message pairs) because the downstream
+    report-writer LLM is not bound to any tools — replaying raw tool_result blocks
+    to a tool-less model is invalid for the Anthropic API.
+    """
+    from langchain_core.messages import ToolMessage
+
+    blocks = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            name = getattr(m, "name", None) or "tool"
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            blocks.append(f"[{name}]\n{content.strip()}")
+    return "\n\n".join(blocks)
+
+
+def _finalize_subagent(result: dict) -> dict:
+    """
+    Collapse a react-agent result into a single AIMessage for the report writer.
+
+    Combines the sub-agent's synthesized answer with the raw tool evidence so the
+    report writer has verifiable numbers to work from — otherwise it only sees the
+    analyst's prose and may (correctly, per its prompt) refuse to trust unattributed
+    statistics, producing a "this looks fabricated" non-answer.
+    """
+    from langchain_core.messages import AIMessage
+
+    messages = result.get("messages", [])
+    final = messages[-1].content if messages else ""
+    if isinstance(final, list):  # Anthropic can return content blocks
+        final = "".join(part.get("text", "") if isinstance(part, dict) else str(part)
+                        for part in final)
+
+    evidence = _extract_tool_evidence(messages)
+    content = final
+    if evidence:
+        content = f"{final}\n\n---\nTOOL OUTPUTS (raw evidence the analysis is based on):\n\n{evidence}"
+
+    return {"messages": [AIMessage(content=content)]}
+
+
+# ---------------------------------------------------------------------------
 # Node: NFL Analyst — established veterans
 # ---------------------------------------------------------------------------
 
@@ -125,14 +176,14 @@ Be concise. Report concrete numbers from the tools, not vague impressions.
 
 def build_nfl_analyst():
     llm = _get_llm()
-    return create_react_agent(llm, ML_TOOLS + RAG_TOOLS, state_modifier=NFL_ANALYST_PROMPT)
+    return create_react_agent(llm, ML_TOOLS + RAG_TOOLS, prompt=NFL_ANALYST_PROMPT)
 
 
 def nfl_analyst_node(state: DynastyState) -> dict:
     agent = build_nfl_analyst()
     query = f"Player: {state['player_name']}, Season: {state['season']}. {state['messages'][-1].content}"
     result = agent.invoke({"messages": [{"role": "user", "content": query}]})
-    return {"messages": result["messages"][-1:]}
+    return _finalize_subagent(result)
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +212,14 @@ projection and explain the model's archetype classification (e.g. "ELITE_PROSPEC
 
 def build_college_scout():
     llm = _get_llm()
-    return create_react_agent(llm, ML_TOOLS + RAG_TOOLS, state_modifier=COLLEGE_SCOUT_PROMPT)
+    return create_react_agent(llm, ML_TOOLS + RAG_TOOLS, prompt=COLLEGE_SCOUT_PROMPT)
 
 
 def college_scout_node(state: DynastyState) -> dict:
     agent = build_college_scout()
     query = f"Prospect: {state['player_name']}, Draft season: {state['season']}. {state['messages'][-1].content}"
     result = agent.invoke({"messages": [{"role": "user", "content": query}]})
-    return {"messages": result["messages"][-1:]}
+    return _finalize_subagent(result)
 
 
 # ---------------------------------------------------------------------------
@@ -194,14 +245,14 @@ recommendation without first calling the relevant tools for every player involve
 
 def build_dynasty_advisor():
     llm = _get_llm()
-    return create_react_agent(llm, ML_TOOLS + RAG_TOOLS, state_modifier=DYNASTY_ADVISOR_PROMPT)
+    return create_react_agent(llm, ML_TOOLS + RAG_TOOLS, prompt=DYNASTY_ADVISOR_PROMPT)
 
 
 def dynasty_advisor_node(state: DynastyState) -> dict:
     agent = build_dynasty_advisor()
     query = state["messages"][-1].content
     result = agent.invoke({"messages": [{"role": "user", "content": query}]})
-    return {"messages": result["messages"][-1:]}
+    return _finalize_subagent(result)
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +260,24 @@ def dynasty_advisor_node(state: DynastyState) -> dict:
 # ---------------------------------------------------------------------------
 
 REPORT_WRITER_PROMPT = """You are finalizing a dynasty fantasy football scouting
-report. The conversation so far contains tool outputs with concrete ML
-projections (PPG, injury risk, confidence levels) and retrieved scouting context.
+report. The preceding assistant message is the work of a specialist analyst
+agent that already ran the ML and retrieval tools; it contains that analyst's
+conclusion followed by a "TOOL OUTPUTS (raw evidence...)" section with the
+verbatim outputs of those tools (PPG projections, injury risk, confidence
+levels, comps, and retrieved scouting context).
+
+Treat that analyst message — including its TOOL OUTPUTS section — as the
+authoritative, already-verified source data. These numbers came from real tools;
+do NOT dismiss them as unverified or fabricated.
 
 Write a clear, well-organized final answer that:
-  1. Leads with the concrete numbers from the ML tools (don't bury the projection)
+  1. Leads with the concrete numbers from the tool outputs (don't bury the projection)
   2. Incorporates qualitative scouting context to explain WHY the model says what it says
   3. Notes confidence/uncertainty honestly — if the model's confidence was LOW
-     or MEDIUM, say so
-  4. Stays grounded ONLY in information that appeared in the tool outputs above —
-     do not invent statistics, comps, or news that weren't retrieved
+     or MEDIUM, say so; if a tool reported no data (e.g. injury risk unavailable),
+     state that plainly rather than inventing a value
+  4. Stays grounded ONLY in information present in the analyst message and its
+     tool outputs above — do not invent statistics, comps, or news that weren't retrieved
 
 Do not call any tools. Just synthesize what's already in the conversation.
 """
@@ -227,9 +286,17 @@ Do not call any tools. Just synthesize what's already in the conversation.
 def report_writer_node(state: DynastyState) -> dict:
     llm = _get_llm(temperature=0.4)  # slightly higher — this is prose synthesis, not tool routing
 
+    # The sub-agent's answer is the last message and is an AIMessage. If we ended
+    # the prompt on that assistant turn, Claude would treat it as a prefill and
+    # continue it rather than writing a fresh report. Append an explicit user turn
+    # so the model produces a clean, self-contained synthesis.
     response = llm.invoke([
         {"role": "system", "content": REPORT_WRITER_PROMPT},
         *state["messages"],
+        {"role": "user", "content": (
+            "Using only the analysis and tool outputs above, write the final "
+            "dynasty scouting report now."
+        )},
     ])
 
     return {

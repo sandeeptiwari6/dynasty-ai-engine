@@ -10,3 +10,5 @@ Pipfile.lock
 .DS_Store
 chroma_db/*
 CLAUDE.md
+.idea
+

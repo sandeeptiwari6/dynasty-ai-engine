@@ -1,8 +1,8 @@
 import logging
-import operator
 from typing import Annotated, Optional, TypedDict
 
 from langchain_core.tools import tool
+from langgraph.graph.message import add_messages
 
 from models.model_store import ModelStore
 from rag.retrieval_tool import (
@@ -37,11 +37,17 @@ class DynastyState(TypedDict):
     """
     Shared state passed between every node in the graph.
 
-    messages uses operator.add as its reducer — LangGraph appends rather than
+    messages uses the add_messages reducer — LangGraph appends rather than
     overwrites on every node transition, which is what gives the supervisor
     the full conversational + tool-call history when deciding what to do next.
+
+    add_messages (not a bare operator.add) is required so that plain dict
+    messages passed into graph.invoke({"messages": [{"role": "user", ...}]})
+    are coerced into LangChain BaseMessage objects. With operator.add the dicts
+    would be appended verbatim and node code doing `msg.content` would raise
+    `AttributeError: 'dict' object has no attribute 'content'`.
     """
-    messages: Annotated[list, operator.add]
+    messages: Annotated[list, add_messages]
 
     # Routing
     query_type: str              # "nfl_analysis" | "college_scouting" | "dynasty_advice" | "injury_check"

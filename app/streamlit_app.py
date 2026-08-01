@@ -3,6 +3,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Set single-threaded OpenMP env vars before any torch/lightgbm import (via the
+# agent/rag imports below) to avoid a macOS libomp segfault. See agent/runtime.py.
+import agent.runtime  # noqa: F401,E402
+
 import streamlit as st
 
 from agent.run import ask_dynasty_scout
