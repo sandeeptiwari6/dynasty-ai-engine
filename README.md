@@ -237,3 +237,4 @@ dynasty-ai-engine/
 ## Status & caveats
 
 This is a personal project for dynasty-league decision support, not financial or professional advice. Projections are model estimates with real uncertainty — the reports surface confidence levels and floor/ceiling ranges precisely so you can weigh them yourself. There is no automated test suite yet; validate changes by running the relevant layer directly.
+
